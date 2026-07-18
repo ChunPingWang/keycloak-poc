@@ -59,14 +59,31 @@
 
 ## 快速開始
 
+本儲存庫除了教學文件，也包含**可建置執行的完整實作**（`src/`，即第 5、6 章的程式碼）：
+
 ```bash
 # 1. 啟動 Keycloak 與 PostgreSQL
 docker compose up -d
 
-# 2. 依第 2 章設定 Realm（或匯入 keycloak/realm-export.json）
+# 2. 依第 2 章設定 Realm、Client、角色與測試使用者
 
-# 3. 啟動 Spring Boot 應用程式
+# 3. 啟動 Spring Boot 應用程式（需先設定後端 client secret）
+export KEYCLOAK_ADMIN_CLIENT_SECRET=<shopmall-backend 的 client secret>
 ./mvnw spring-boot:run
+
+# 4. 執行測試（不需 Docker，21 個測試涵蓋領域規則、授權與架構規則）
+./mvnw test
 ```
+
+### 實作完成度
+
+| 關注點 | 實作位置 |
+|---|---|
+| **Authentication**（JWT 驗證、`realm_access.roles` → `ROLE_*` 轉換） | `infrastructure/security/`（`SecurityConfig`、`KeycloakRealmRoleConverter`、`AuthenticatedIdentity`） |
+| **Authorization**（URL 規則、`@PreAuthorize` 角色檢查、「只能改自己」領域授權） | `SecurityConfig` + `AdminMemberController` + `MemberProfileService` |
+| 會員領域模型（聚合、值物件、領域事件） | `domain/` |
+| 使用案例（註冊、查詢、更新、停權） | `application/` |
+| Keycloak Admin API 防腐層、JPA 持久化、REST API | `infrastructure/` |
+| 測試（領域單元、應用層記憶體 Adapter、Security 切片、ArchUnit） | `src/test/` |
 
 建議按章節順序閱讀；若你已熟悉 OAuth2/OIDC，可直接從第 3 章開始。
