@@ -222,29 +222,20 @@ Keycloak(簽發方)                          Resource Server(驗證方)
 
 完整時序(含每一步的設計理由):
 
-```
-Browser(前端通道)                Client 後端(後端通道)              Keycloak
-   │                                  │                              │
-   │ 1. 點擊登入                        │                              │
-   │─────────────────────────────────▶│                              │
-   │ 2. 302 Redirect 到 /auth          │                              │
-   │    ?response_type=code            │                              │
-   │    &client_id=...                 │                              │
-   │    &redirect_uri=...              │                              │
-   │    &scope=...&state=xyz           │                              │
-   │◀─────────────────────────────────│                              │
-   │ 3. 使用者在 Keycloak 登入頁輸入帳密(密碼只給 Keycloak,Client 永遠看不到!)│
-   │─────────────────────────────────────────────────────────────────▶│
-   │ 4. 302 回 redirect_uri?code=abc&state=xyz                         │
-   │◀─────────────────────────────────────────────────────────────────│
-   │ 5. 帶 code 回 Client               │                              │
-   │─────────────────────────────────▶│                              │
-   │                                  │ 6. POST /token(後端對後端)     │
-   │                                  │    code + client_secret       │
-   │                                  │─────────────────────────────▶│
-   │                                  │ 7. access_token +             │
-   │                                  │    refresh_token(+id_token)  │
-   │                                  │◀─────────────────────────────│
+```mermaid
+sequenceDiagram
+    autonumber
+    actor B as Browser(前端通道)
+    participant C as Client 後端(後端通道)
+    participant KC as Keycloak
+
+    B->>C: 點擊登入
+    C-->>B: 302 Redirect 到 /auth<br/>?response_type=code&client_id=...<br/>&redirect_uri=...&scope=...&state=xyz
+    B->>KC: 使用者在 Keycloak 登入頁輸入帳密<br/>(密碼只給 Keycloak,Client 永遠看不到!)
+    KC-->>B: 302 回 redirect_uri?code=abc&state=xyz
+    B->>C: 帶 code 回 Client
+    C->>KC: POST /token(後端對後端)<br/>code + client_secret
+    KC-->>C: access_token + refresh_token(+ id_token)
 ```
 
 **每個設計細節的「為什麼」:**
@@ -438,19 +429,19 @@ Keycloak 內建 FAPI 支援(Client Policies 中可套用 `fapi-2-security-profil
 
 ### 4.2 SAML SSO 流程(SP-Initiated)
 
-```
-Browser              SP(應用)                    IdP(Keycloak)
-  │ 1. 存取受保護資源     │                            │
-  │────────────────────▶│                            │
-  │ 2. 302 + AuthnRequest(deflate+base64 於 URL)     │
-  │◀────────────────────│                            │
-  │ 3. 轉送 AuthnRequest                              │
-  │──────────────────────────────────────────────────▶│
-  │ 4. 登入後回傳 SAMLResponse(含簽章的 Assertion)      │
-  │    以自動送出的 HTML form POST 回 SP 的 ACS URL     │
-  │◀──────────────────────────────────────────────────│
-  │ 5. POST SAMLResponse │                            │
-  │────────────────────▶│ 6. 驗 XML 簽章、建立 session  │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor B as Browser
+    participant SP as SP(應用)
+    participant IdP as IdP(Keycloak)
+
+    B->>SP: 存取受保護資源
+    SP-->>B: 302 + AuthnRequest(deflate+base64 於 URL)
+    B->>IdP: 轉送 AuthnRequest
+    IdP-->>B: 登入後回傳 SAMLResponse(含簽章的 Assertion)<br/>以自動送出的 HTML form POST 回 SP 的 ACS URL
+    B->>SP: POST SAMLResponse
+    SP->>SP: 驗 XML 簽章、建立 session
 ```
 
 **底層重點:**
@@ -469,6 +460,34 @@ Browser              SP(應用)                    IdP(Keycloak)
 ## Module 5:Keycloak 核心架構剖析
 
 ### 5.1 整體架構(Quarkus 發行版)
+
+先用 **C4 Model 的容器圖(Level 2)** 看部署視角 — 哪些是獨立行程/儲存、彼此如何互動:
+
+```mermaid
+C4Container
+    title Keycloak 容器圖(C4 Level 2):部署視角
+
+    Person(user, "使用者", "登入的員工或客戶")
+    Person(admin, "管理者", "維運 Keycloak 的人")
+    System_Boundary(kc, "Keycloak 平台") {
+        Container(node, "Keycloak 節點 ×N", "Quarkus / JVM", "OIDC/SAML 端點、認證流程引擎、Token 簽發、Admin API、SPI 擴充")
+        Container(ispn, "Infinispan 快取層", "embedded,JGroups 叢集通訊", "sessions / authenticationSessions / realm 與 user 快取")
+        ContainerDb(db, "PostgreSQL", "RDBMS", "users、clients、realm 設定、events、persistent sessions(26.x 預設)")
+    }
+    System_Ext(app, "應用程式群", "OIDC / SAML clients 與 Resource Servers")
+    System_Ext(ldap, "LDAP / AD", "User Federation 對象")
+    System_Ext(extidp, "外部 IdP", "Identity Brokering 對象")
+
+    Rel(user, node, "登入", "HTTPS")
+    Rel(admin, node, "管理", "Admin Console / Admin REST API")
+    Rel(app, node, "認證/授權、取 JWKS", "OIDC / SAML")
+    Rel(node, ispn, "快取讀寫、跨節點失效通知")
+    Rel(node, db, "持久化", "JPA / JDBC")
+    Rel(node, ldap, "User Federation", "LDAP(S)")
+    Rel(node, extidp, "Identity Brokering", "OIDC / SAML")
+```
+
+再深入單一節點的**內部分層**:
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -774,12 +793,23 @@ Keycloak ──▶ Azure AD / Google / 另一座 Keycloak / SAML IdP
 
 ### 8.3 Identity Brokering 流程
 
-```
-使用者 ──▶ Keycloak 登入頁 ──▶ 點「以 Azure AD 登入」
-       ──▶ Keycloak 以 OIDC Client 身分把使用者導去 Azure AD
-       ──▶ Azure AD 認證後回斷言給 Keycloak
-       ──▶ First Login Flow:建立/連結本地帳號、屬性映射
-       ──▶ Keycloak 對應用簽發自己的 token
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 使用者
+    participant App as 應用程式
+    participant KC as Keycloak(Broker)
+    participant AAD as Azure AD(上游 IdP)
+
+    U->>App: 存取應用
+    App-->>U: 302 導向 Keycloak /auth
+    U->>KC: Keycloak 登入頁 → 點「以 Azure AD 登入」
+    KC-->>U: 302(Keycloak 以 OIDC Client 身分導去 Azure AD)
+    U->>AAD: 在 Azure AD 完成認證
+    AAD-->>KC: 回斷言(code → token)給 Keycloak
+    KC->>KC: First Login Flow:建立/連結本地帳號、屬性映射
+    KC-->>App: 對應用簽發 Keycloak 自己的 token
+    Note over App,KC: 應用只信任 Keycloak 一個 issuer,上游 IdP 更換不影響應用
 ```
 
 **架構價值:** 應用只需信任 Keycloak 一個 issuer,上游 IdP 的更換/增加不影響應用 — 這就是「身分反壅塞層(Anti-Corruption Layer)」。

@@ -63,6 +63,32 @@
          └────────────┘
 ```
 
+用 **C4 Model 的系統情境圖(Level 1)** 看 Keycloak 在整體架構中的位置 — 它對內是所有應用的登入委託對象,對外可以接既有目錄與第三方身分來源:
+
+```mermaid
+C4Context
+    title 系統情境圖(C4 Level 1):Keycloak 在整體架構中的位置
+
+    Person(user, "使用者", "員工或客戶")
+    System_Boundary(org, "你的組織") {
+        System(appA, "Web 應用", "傳統有後端的應用")
+        System(appB, "SPA / Mobile", "純前端或行動應用")
+        System(api, "後端 API", "Resource Server")
+        System(keycloak, "Keycloak", "集中式 IAM:認證、授權、SSO")
+    }
+    System_Ext(ldap, "LDAP / AD", "既有企業目錄")
+    System_Ext(extidp, "外部 IdP", "Google、Azure AD 等")
+
+    Rel(user, appA, "使用")
+    Rel(user, appB, "使用")
+    Rel(appA, keycloak, "登入委託", "OIDC")
+    Rel(appB, keycloak, "登入委託", "OIDC + PKCE")
+    Rel(appA, api, "呼叫", "Bearer token")
+    Rel(api, keycloak, "取公鑰離線驗 token", "JWKS")
+    Rel(keycloak, ldap, "User Federation")
+    Rel(keycloak, extidp, "Identity Brokering")
+```
+
 它提供:
 
 | 能力 | 說明 |
@@ -325,12 +351,22 @@ echo $AT | cut -d. -f2 | python3 -c 'import sys,base64,json; s=sys.stdin.read().
 
 ### 4.4 為什麼 API 驗 token 不用連 Keycloak?(核心觀念)
 
-```
-Keycloak(簽發方)                        你的 API(驗證方)
-┌─────────────────────┐                ┌─────────────────────────┐
-│ 用【私鑰】對 payload   │ ──── JWT ────▶ │ 從 JWKS 端點取【公鑰】(可快取)│
-│ 簽章                  │                │ 離線驗章 → 不必回呼 Keycloak │
-└─────────────────────┘                └─────────────────────────┘
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client(你的應用)
+    participant KC as Keycloak(簽發方)
+    participant API as 你的 API(驗證方)
+
+    C->>KC: 登入流程(第 5 章)
+    KC->>KC: 用【私鑰】對 payload 簽章
+    KC-->>C: access_token(JWT)
+    C->>API: GET /resource(Authorization Bearer JWT)
+    API->>KC: 首次:GET /certs 取【公鑰】
+    KC-->>API: JWKS(依 kid 對應,可長期快取)
+    API->>API: 離線驗章 + 核對 iss / aud / exp
+    API-->>C: 200 資源內容
+    Note over API: 之後每個請求都離線驗證,不再回呼 Keycloak
 ```
 
 - 沒有私鑰,任何人都**偽造不了**簽章 → API 只要用公鑰驗章即可信任 token 內容
@@ -351,16 +387,25 @@ curl -s http://localhost:8080/realms/demo/protocol/openid-connect/certs | python
 
 ### 5.1 流程總覽
 
-```
-瀏覽器                        你的應用                     Keycloak
-  │ 1. 點「登入」                 │                           │
-  │  2. 302 導向 Keycloak 登入頁(帶 client_id、redirect_uri、  │
-  │     state、code_challenge)                               │
-  │──────────────────────────────────────────────────────────▶│
-  │ 3. 使用者輸入帳密(密碼只給 Keycloak,應用永遠看不到!)        │
-  │ 4. 302 導回 redirect_uri?code=xxx&state=xxx                │
-  │◀──────────────────────────────────────────────────────────│
-  │ 5. 應用拿 code + code_verifier 向 token 端點兌換 token       │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 使用者(瀏覽器)
+    participant C as 你的應用(spa-app)
+    participant KC as Keycloak
+
+    U->>C: 點「登入」
+    C->>C: 產生 code_verifier、code_challenge、state
+    C-->>U: 302 導向 Keycloak /auth<br/>(client_id、redirect_uri、state、code_challenge)
+    U->>KC: GET /auth
+    KC-->>U: 顯示登入頁
+    U->>KC: 輸入帳密(密碼只給 Keycloak,應用永遠看不到!)
+    KC-->>U: 302 導回 redirect_uri?code=xxx&state=xxx<br/>並發 SSO session cookie
+    U->>C: 帶 code 回應用
+    C->>C: 比對 state 是否為自己發出的值
+    C->>KC: POST /token(code + code_verifier)
+    KC->>KC: 驗證 SHA256(code_verifier) == 當初的 code_challenge
+    KC-->>C: access_token + refresh_token + id_token
 ```
 
 **為什麼繞這麼一大圈?**
@@ -492,6 +537,27 @@ echo "$LOC2"
 - 使用者的登入狀態存在「**對 Keycloak 網域**」的 session cookie 裡(不是對各應用)
 - App B 把使用者導到 Keycloak → Keycloak 看到有效 cookie → 免登入直接發 code
 - 對使用者來說就是「登入一次,到處通行」
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 使用者(瀏覽器)
+    participant A as App A
+    participant B as App B
+    participant KC as Keycloak
+
+    U->>A: 存取 App A
+    A-->>U: 302 導向 Keycloak /auth
+    U->>KC: GET /auth(無 cookie)
+    KC-->>U: 登入頁 → 輸入帳密
+    KC-->>U: 發 SSO session cookie<br/>+ 302 code 給 App A
+    Note over U,KC: 稍後,同一個瀏覽器…
+    U->>B: 存取 App B
+    B-->>U: 302 導向 Keycloak /auth
+    U->>KC: GET /auth(帶有效 session cookie)
+    KC->>KC: cookie 對應到有效 SSO session
+    KC-->>U: 免登入,直接 302 code 給 App B
+```
 
 ---
 
