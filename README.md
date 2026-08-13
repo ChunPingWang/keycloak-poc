@@ -686,14 +686,21 @@ Spring 會自動抓 discovery → 取得 JWKS → 快取公鑰 → 離線驗每�
 
 ### 8.2 Session 與 Token 的關係
 
-```
-瀏覽器                          Keycloak
-┌──────────────────┐            ┌────────────────────────────────┐
-│ Cookie:           │            │ SSO Session(登入狀態本體)        │
-│ AUTH_SESSION_ID   │◀── 對應 ──▶│  ├─ Client Session: web-app    │
-│ KEYCLOAK_IDENTITY │            │  ├─ Client Session: spa-app    │
-└──────────────────┘            │  └─ …每個應用一個                │
-                                └────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph browser["瀏覽器"]
+        cookie["Cookie:<br/>AUTH_SESSION_ID<br/>KEYCLOAK_IDENTITY"]
+    end
+    subgraph kc["Keycloak"]
+        sso["SSO Session<br/>(登入狀態本體)"]
+        cs1["Client Session: web-app"]
+        cs2["Client Session: spa-app"]
+        cs3["…每個應用一個"]
+        sso --> cs1
+        sso --> cs2
+        sso --> cs3
+    end
+    cookie <-->|對應| sso
 ```
 
 - **登入狀態的本體是 Keycloak 的 session**,token 只是它的「短期產物」
