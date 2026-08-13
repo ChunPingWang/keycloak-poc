@@ -106,10 +106,15 @@ docker run -d --name keycloak \
 
 > **版本注意**:Keycloak 26 起,管理員帳號的環境變數是 `KC_BOOTSTRAP_ADMIN_USERNAME` / `KC_BOOTSTRAP_ADMIN_PASSWORD`(舊版教學常見的 `KEYCLOAK_ADMIN` 已淘汰)。這組帳號是「臨時開機帳號」,生產環境應在首次登入後建立正式管理員並移除它。
 
-確認啟動成功:
+確認啟動成功(啟動需要約 10~15 秒,太早打端點會得到 `Expecting value: line 1 column 1` 這種 JSON 解析錯誤 — 那只是伺服器還沒就緒,不是你做錯了):
 
 ```bash
-# 等待就緒,然後打 OIDC Discovery 端點
+# 等待就緒(每 2 秒重試,最多 60 秒)
+until curl -sf http://localhost:8080/realms/master/.well-known/openid-configuration >/dev/null; do
+  echo "等待 Keycloak 啟動中..."; sleep 2
+done
+
+# 打 OIDC Discovery 端點確認
 curl -s http://localhost:8080/realms/master/.well-known/openid-configuration | python3 -m json.tool | head -20
 ```
 
@@ -273,11 +278,23 @@ curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token 
 
 ### 4.3 解剖 JWT:三段式結構
 
-JWT 長這樣:`Header.Payload.Signature`,前兩段只是 **Base64URL 編碼(不是加密!)**,任何人都能解開來讀:
+JWT 長這樣:`Header.Payload.Signature`,前兩段只是 **Base64URL 編碼(不是加密!)**,任何人都能解開來讀。
+
+先把 token 抓進變數(不必手動複製貼上 — 重打一次 4.1 的請求,順手把 access_token 與 refresh_token 存起來,後面章節都會用到):
 
 ```bash
-# 把 access_token 存進變數後,解碼 header 與 payload
-AT="<你的 access_token>"
+RESP=$(curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token \
+  -d grant_type=password \
+  -d client_id=web-app -d client_secret=web-app-secret \
+  -d username=alice -d password=alice-password \
+  -d 'scope=openid profile email')
+AT=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+RT=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["refresh_token"])')
+```
+
+然後解碼 header 與 payload:
+
+```bash
 echo $AT | cut -d. -f1 | python3 -c 'import sys,base64,json; s=sys.stdin.read().strip(); print(json.dumps(json.loads(base64.urlsafe_b64decode(s+"=="))), sep="\n")'
 echo $AT | cut -d. -f2 | python3 -c 'import sys,base64,json; s=sys.stdin.read().strip(); print(json.dumps(json.loads(base64.urlsafe_b64decode(s+"==")), indent=2))'
 ```
@@ -357,11 +374,10 @@ curl -s http://localhost:8080/realms/demo/protocol/openid-connect/certs | python
 
 ### 5.2 完整實作腳本(✅ 已驗證)
 
-存成 `authcode-lab.sh` 執行,或逐段貼到終端機:
+**逐段貼到目前的終端機執行**(或存成 `authcode-lab.sh` 後用 `source authcode-lab.sh` 執行)。
+注意:**不要用 `bash authcode-lab.sh` 跑** — 那會在子 shell 執行,`$CODE`、`$VERIFIER`、cookie jar 等變數會隨腳本結束消失,第 6 章的實驗就接不上了:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
 BASE=http://localhost:8080
 REALM=demo
 CLIENT=spa-app
@@ -389,10 +405,13 @@ CODE=$(printf '%s' "$LOC" | grep -oP 'code=\K[^&]+' | head -1)
 echo "拿到 authorization code:${CODE:0:20}..."
 
 # ── 步驟 4:用 code + code_verifier 兌換 token(公開客戶端,無 secret!)──
-curl -s -X POST "$BASE/realms/$REALM/protocol/openid-connect/token" \
+TOKENS=$(curl -s -X POST "$BASE/realms/$REALM/protocol/openid-connect/token" \
   -d grant_type=authorization_code -d client_id=$CLIENT \
   -d code="$CODE" -d redirect_uri="$REDIRECT" \
-  -d code_verifier="$VERIFIER" | python3 -m json.tool
+  -d code_verifier="$VERIFIER")
+echo "$TOKENS" | python3 -m json.tool
+# 存下 access token,第 6 章的實驗會用到
+AT=$(echo "$TOKENS" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 ```
 
 ✅ **實測結果**:成功取得 access token —— 全程沒有用到任何 client secret,這就是 PKCE 讓公開客戶端安全走完授權流程的價值。
@@ -428,7 +447,25 @@ curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token/
 
 ### 實驗 2:錯誤的 code_verifier 會被拒絕
 
-用正確的 code、錯誤的 verifier 兌換:
+第 5 章的 code 已在實驗 1 用掉了,先拿一個新的 code(沿用 cookie jar,你會發現**不需要重新登入** — 這正是實驗 4 要講的 SSO):
+
+```bash
+VERIFIER2=$(openssl rand -base64 60 | tr -d '=+/\n' | cut -c1-64)
+CHALLENGE2=$(printf '%s' "$VERIFIER2" | openssl dgst -sha256 -binary \
+             | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+AUTH_URL2="$BASE/realms/$REALM/protocol/openid-connect/auth?response_type=code&client_id=$CLIENT&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&scope=openid&state=demo2&code_challenge=$CHALLENGE2&code_challenge_method=S256"
+LOC2=$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' "$AUTH_URL2")
+CODE2=$(printf '%s' "$LOC2" | grep -oP 'code=\K[^&]+' | head -1)
+```
+
+然後用正確的 code、**錯誤的 verifier** 兌換:
+
+```bash
+curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token \
+  -d grant_type=authorization_code -d client_id=spa-app \
+  -d code="$CODE2" -d redirect_uri=http://localhost:3000/callback \
+  -d code_verifier="wrong-verifier-wrong-verifier-wrong-verifier-1234567"
+```
 
 **實測結果**:
 
@@ -444,17 +481,12 @@ Keycloak 把收到的 `code_verifier` 重算 SHA-256,與當初的 `code_challeng
 
 ### 實驗 4:SSO 的本質 —— 一顆發給 Keycloak 網域的 Cookie
 
-沿用第 5 章的 cookie jar(裡面有 `AUTH_SESSION_ID`、`KEYCLOAK_IDENTITY` 等 cookie),重新產生一組 PKCE 參數(verifier/challenge 不可重用),**再發一次授權請求**:
+其實你在實驗 2 已經親眼看過了:拿新 code 時,只因為帶著第 5 章的 cookie jar(裡面有 `AUTH_SESSION_ID`、`KEYCLOAK_IDENTITY` 等 cookie),Keycloak **沒有再顯示登入頁**,直接 302 發新的 code 回來。把 redirect URL 印出來看:
 
 ```bash
-VERIFIER2=$(openssl rand -base64 60 | tr -d '=+/\n' | cut -c1-64)
-CHALLENGE2=$(printf '%s' "$VERIFIER2" | openssl dgst -sha256 -binary \
-             | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-AUTH_URL2="$BASE/realms/$REALM/protocol/openid-connect/auth?response_type=code&client_id=$CLIENT&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&scope=openid&state=demo2&code_challenge=$CHALLENGE2&code_challenge_method=S256"
-curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}\n' "$AUTH_URL2"
+echo "$LOC2"
+# http://localhost:3000/callback?state=demo2&session_state=…&code=…  ← 免登入直接發 code
 ```
-
-**實測結果**:Keycloak **不再顯示登入頁**,直接 302 發新的 code 回來。
 
 這就是 SSO 的全部秘密:
 - 使用者的登入狀態存在「**對 Keycloak 網域**」的 session cookie 裡(不是對各應用)
