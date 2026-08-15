@@ -226,6 +226,8 @@ Keycloak(簽發方)                          Resource Server(驗證方)
 - [ ] 到 [jwt.io](https://jwt.io) 貼上一個 Keycloak 簽發的 Token,觀察 header/payload/signature 三段結構
 - [ ] 寫一段 Java 程式,用 Nimbus JOSE 函式庫從 JWKS 端點取公鑰並驗證 JWT
 
+> 📚 **延伸閱讀**:想把 JWT 本身鑽到底(Base64 位元組、簽章數學、`alg=none` 與演算法混淆攻擊、手刻 MiniJwt、DPoP/mTLS/PASETO),見姊妹教材 [jwt-tutorial](https://github.com/ChunPingWang/jwt-tutorial-part2) — 15 章 + 可跑的 bash/Python/Java Labs,每個宣稱都經實機驗證。本課綱只在「夠用來理解 Keycloak」的深度停留,那份則專攻 JWT 協定與攻防。
+
 ---
 
 ## Module 2:OAuth 2.0 底層原理
