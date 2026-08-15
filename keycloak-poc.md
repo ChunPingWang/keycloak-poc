@@ -25,6 +25,8 @@
 - [Module 13:企業實戰場景(金融業視角)](#module-13企業實戰場景金融業視角)
 - [附錄 A:常見面試/評估問題](#附錄-a常見面試評估問題)
 - [附錄 B:參考資源](#附錄-b參考資源)
+- [附錄 C:錯誤訊息排查對照表](#附錄-c錯誤訊息排查對照表)
+- [附錄 D:近期版本演進重點(22 → 26)](#附錄-d近期版本演進重點22--26)
 
 ---
 
@@ -117,10 +119,32 @@ Phase 4(生產層,約 2 週)                     ▼
 | Token | 承載身分/授權資訊的資料結構 | Access / ID / Refresh Token |
 | Claim | Token 內的一筆屬性斷言 | Protocol Mapper 產出 |
 
-### 0.4 學習任務
+### 0.4 產品選型:為什麼是 Keycloak?
+
+導入前必須先回答「為什麼不是別的」。以架構師的評估維度比較:
+
+| 維度 | Keycloak(自建) | Okta / Auth0 / Entra ID(SaaS) | Ory / Authentik / Zitadel(開源) |
+|------|----------------|------------------------------|--------------------------------|
+| 授權成本 | 軟體免費,成本在**人力與基礎設施** | 依 MAU/MAU 級距計費,規模大時極貴 | 免費/部分商業版 |
+| 資料落地 | **完全自控**(金融、醫療、政府剛需) | 資料在境外雲(法遵可能不允許) | 自控 |
+| 客製深度 | **SPI 可替換幾乎每一層** | 僅限廠商開放的 Hook/Action | 中等 |
+| 協定完整度 | OIDC + SAML + UMA + FAPI + CIBA 全備 | 完整 | 多數不支援 SAML IdP 或 UMA |
+| 維運負擔 | **高**(HA、升級、備份、監控全自理) | 極低 | 中 |
+| 商業支援 | Red Hat build of Keycloak(RHBK)提供訂閱式支援與長期維護版本 | 原廠 SLA | 視廠商 |
+
+**決策準則:**
+
+- 若「資料必須落地」或「認證流程需要深度客製(如串接核心系統風控)」→ Keycloak 幾乎是唯一選項
+- 若團隊沒有能力承擔 24×7 的 IAM 維運 → 評估 SaaS,或採 Keycloak + RHBK 訂閱
+- **社群版的隱藏成本**:上游社群版只維護最新版本,沒有長期維護分支(見 §12.6),企業必須有能力每年升級 2~3 次;不能接受此節奏者應評估 RHBK
+
+> **常見決策誤區:** 只比較「授權費 vs 0 元」。真實的 TCO 應納入:HA 基礎設施、升級與相容性測試工時、SPI 開發與維護、以及事故時的自救能力。
+
+### 0.5 學習任務
 
 - [ ] 畫出你目前客戶環境的身分架構現況圖(As-Is)
 - [ ] 列出三個「沒有集中式 IAM 導致的實際問題」案例
+- [ ] 用上表對你的專案做一次選型評估,產出一頁 ADR(含被否決方案與否決理由)
 
 ---
 
@@ -390,7 +414,57 @@ Browser                         Keycloak
 - 每個 SSO Session 下掛多個 Client Session,各自追蹤 token 發放狀態
 - **登出的複雜性**由此而生:登出要銷毀 SSO session + 通知所有 client(Back-Channel Logout / Front-Channel Logout)
 
-### 3.5 進階端點與規格
+### 3.5 登出機制 — 比登入更難的那一半
+
+登入只要一次成功;**登出要讓 N 個系統同時失效**。這是 SSO 導入案最常被低估的部分。
+
+**三種登出途徑,語意完全不同:**
+
+| 方式 | 端點 / 手段 | 銷毀範圍 | 使用場景 |
+|------|------------|---------|---------|
+| RP-Initiated Logout | `GET /protocol/openid-connect/logout?id_token_hint=…&post_logout_redirect_uri=…` | **整個 SSO session**(所有 client) | 使用者按「登出」 |
+| 後端撤銷 | `POST /protocol/openid-connect/logout`(帶 `refresh_token` + client 認證) | 該 refresh token 對應的 session | BFF / 機密客戶端後端登出 |
+| Admin 強制登出 | `POST /admin/realms/{r}/users/{id}/logout` | 該使用者全部 session | 停權、資安事件、客服協助 |
+
+補充:`POST /protocol/openid-connect/revoke`(RFC 7009)只撤銷單一 token,**不銷毀 session** — 語意上是「撤票」而非「登出」,兩者不可混用。
+
+**通知其他應用的兩種通道:**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 使用者
+    participant KC as Keycloak
+    participant A as App A(後端)
+    participant B as App B(後端)
+
+    U->>KC: GET /logout(id_token_hint)
+    KC->>KC: 銷毀 SSO session 與所有 client session
+    par Back-Channel(伺服器對伺服器)
+        KC->>A: POST backchannel_logout_uri<br/>logout_token(JWT,含 sid / sub / events)
+        A->>A: 驗章 + 依 sid 殺掉自己的 session
+        KC->>B: POST backchannel_logout_uri
+        B->>B: 同上
+    end
+    KC-->>U: 302 導回 post_logout_redirect_uri
+```
+
+- **Back-Channel Logout**:Keycloak 對每個 client 註冊的 `backchannel_logout_uri` 送出 `logout_token`(JWT,`events` 內含 `http://schemas.openid.net/event/backchannel-logout`,並帶 `sid` 或 `sub`)。應用**必須驗簽、驗 `iss`/`aud`,並確認 `logout_token` 沒有 `nonce`**,再依 `sid` 終止本地 session。
+- **Front-Channel Logout**:Keycloak 回一頁,內嵌各 client 的 `frontchannel_logout_uri` iframe。**在現代瀏覽器封鎖第三方 cookie 後大量失效** — 新建置一律優先選 Back-Channel。
+- SAML 對應機制為 **SLO(Single Logout)**,同樣有 POST/Redirect binding 之分,混合協定環境要兩套都配。
+
+**各拓撲下的失效情境(架構師必須事先識別):**
+
+| 情境 | 後果 | 對策 |
+|------|------|------|
+| 應用在內網、Keycloak 在 DMZ,無法回連 | Back-Channel 通知送不到 | 開放單向白名單,或應用改為短 session + introspection |
+| 應用是無狀態 API(只驗 JWT) | 登出後 access token **仍有效到過期** | 縮短 access token(≤5 分)、高風險操作改用 introspection 或 token 撤銷檢查 |
+| 應用有本地 session 但沒實作 logout endpoint | 使用者「登出後仍在線」 | 導入驗收清單必列此項 |
+| `post_logout_redirect_uri` 未註冊 | Keycloak 拒絕導回(26.x 嚴格檢查) | client 的 `post.logout.redirect.uris` 需明確設定 |
+
+> **必背結論:** 登出銷毀的是 **session**,不是已簽發的 **access token**。「登出後 token 還能用幾分鐘」不是 bug,是 JWT 離線驗證的既定代價(見 §1.3)。要壓到零,只能付出 introspection 的網路成本。
+
+### 3.6 進階端點與規格
 
 | 規格 | 用途 | 金融業相關性 |
 |------|------|-------------|
@@ -404,11 +478,12 @@ Browser                         Keycloak
 
 Keycloak 內建 FAPI 支援(Client Policies 中可套用 `fapi-2-security-profile`)。
 
-### 3.6 學習任務
+### 3.7 學習任務
 
 - [ ] 抓取你 Realm 的 discovery document,逐欄位解釋
 - [ ] 實測:登入 App A 後開 App B,用瀏覽器 DevTools 觀察完整 redirect 鏈與 cookie
 - [ ] 設計一個「ID Token 誤用」的攻擊場景,並說明正確的 `aud` 驗證如何阻止它
+- [ ] 為兩個 client 設定 Back-Channel Logout,登出後驗證兩邊的本地 session 都被終止;再故意斷開其中一個的回連路徑,觀察失效行為
 
 ---
 
@@ -552,6 +627,22 @@ Keycloak Instance
 - `master` realm 只用於管理 Keycloak 本身,永遠不要掛業務應用
 - Role 設計:優先使用 **Composite Roles + Groups** 建立權限模型,而非在應用內硬編 role 名稱
 
+**Organizations(26.0 GA)— Realm 之下的第三種切分:**
+
+過去 B2B 多租戶只有兩個難用的選擇:每個企業客戶開一個 Realm(數量爆炸、管理成本高),或用 Group 硬幹(沒有身分來源隔離)。26.0 起的 **Organizations** 補上中間層:
+
+```
+Realm(customers)
+└── Organization(每個企業客戶一個)
+    ├── Members(組織成員)
+    ├── Domains(email 網域,登入時據此自動路由)
+    └── Identity Providers(該組織自己的 IdP,如客戶的 Azure AD)
+```
+
+- 使用者輸入 email → 依網域自動導向該組織綁定的 IdP(組織層級的 Home Realm Discovery)
+- token 中可加入組織資訊(`organization` scope / mapper),應用據此做租戶隔離
+- **選型準則**:同一套政策、只是客戶不同 → 用 Organizations;政策/session/MFA 要求完全不同 → 才切 Realm
+
 ### 5.3 Authentication Flow 引擎(底層)
 
 Keycloak 的認證不是寫死的,而是一個**可編排的執行引擎**:
@@ -583,7 +674,36 @@ Token 中每個非標準 claim 都來自一個 Mapper:
 
 **架構意涵:** Token 是 IdP 與應用之間的 API 契約。Mapper 的變更 = 契約變更,應納入變更管理。
 
-### 5.5 儲存層與快取層底層
+### 5.5 Client Scopes 與 User Profile — Token 契約的治理
+
+§5.4 的 Mapper 是「一條 claim 的生產線」,但**在幾十個 client 上重複設定 mapper 是治理災難**。Keycloak 用兩個機制解決:
+
+**Client Scopes(可重用的 mapper 包):**
+
+| 類型 | 行為 | 用途 |
+|------|------|------|
+| **Default** | 每次發 token 一律套用 | 該 client 恆定需要的 claim(如 `branch_code`) |
+| **Optional** | 只有授權請求的 `scope` 參數帶到才套用 | 敏感或體積大的 claim(如完整組織架構) |
+
+- 內建 `profile`、`email`、`roles`、`web-origins`、`acr` 等 scope 即以此實作
+- 治理做法:**把企業共用的 claim 定義成一個自訂 client scope**(如 `bank-identity`),所有 client 掛載它 — 契約集中一處,變更一次到位
+
+**Audience 的正確做法:** 不要靠「原 token 直傳」碰運氣。在 client scope 中放 **Audience Mapper**,明示這張 token 可被哪些 Resource Server 接受;Resource Server 嚴格驗 `aud`。這是微服務環境避免 token 混用的關鍵設計。
+
+**Token 體積 — 被低估的生產事故源:**
+
+- role 一多(尤其 composite role 展開)、group 全帶、屬性全塞 → JWT 可膨脹到數 KB
+- 後果:`Authorization` header 超過 Nginx/Apache 預設 header 上限(常見 4~8 KB)→ **登入正常但呼叫 API 隨機 400/431**
+- 對策:`Full scope allowed` 關閉(只帶該 client 需要的 role)、大屬性改走 UserInfo 端點、必要時調高代理的 header buffer
+
+**Declarative User Profile(24 起 GA,26.x 預設啟用):**
+
+- Realm 以 JSON schema 宣告使用者有哪些屬性、型別、必填、誰可讀寫(admin/user)、驗證規則
+- **關鍵行為變更**:未在 schema 中宣告的屬性(unmanaged attributes)**預設被拒絕寫入**
+- 這是升級到 24+ 最常見的踩雷點:「以前用 Admin API 塞自訂屬性都好好的,升級後屬性憑空消失」→ 需在 Realm settings → General 開啟 Unmanaged Attributes,或(建議)正式宣告該屬性
+- 架構意涵:使用者屬性從「隨便塞的 key-value」升格為**有版控的資料契約** — 應與 token claim 契約一起納入變更管理
+
+### 5.6 儲存層與快取層底層
 
 **資料庫(建議 PostgreSQL):**
 
@@ -602,11 +722,13 @@ Token 中每個非標準 claim 都來自一個 Mapper:
 - **Invalidation 模式**:改了 user → 發失效訊息 → 其他節點丟棄快取、下次讀 DB。理解這個,才能解釋「為什麼多節點下改資料不會讀到舊值」
 - `owners=2`:每筆 session 存於 2 個節點,單節點故障不掉 session
 
-### 5.6 學習任務
+### 5.7 學習任務
 
 - [ ] 連進 Keycloak 的 PostgreSQL,追蹤一次登入在 `event_entity` 與 session 相關結構的變化
 - [ ] 把 Browser Flow 複製一份,加入 Conditional OTP,並解釋每個 requirement 的執行語意
 - [ ] 用兩個 client 實驗 Audience Mapper:讓 client A 取得的 token 能被 API B 接受
+- [ ] 建立一個自訂 Client Scope(含 2 個 mapper),掛到兩個 client 上,驗證「改一處、兩邊 token 同時變更」
+- [ ] 刻意給一個使用者掛 50 個 role,量測 access token 的位元組大小,並觀察反向代理的 header 上限行為
 
 ---
 
@@ -653,11 +775,54 @@ metrics-enabled=true
 - **keycloak-config-cli** 或 **Terraform provider(keycloak)**:宣告式管理 realm/client/role — 建議納入你既有的 ArgoCD GitOps 流程
 - 原則:**Admin Console 只用於探索,生產變更一律走版控**
 
-### 6.4 學習任務
+### 6.4 Admin REST API 與管理權限治理
+
+自動化的入口是 Admin REST API(Admin Console 本身也只是它的前端)。
+
+**正確的機器身分取得方式** — 不要用 `admin` 帳號的 password grant(ROPC 已廢棄且權限過大),而是為自動化建立**專用 service account** 並只給必要角色:
+
+```bash
+# 1. 在目標 realm 建立 client(啟用 service account、關閉互動流程)
+POST /admin/realms/{realm}/clients
+{ "clientId": "automation", "publicClient": false, "serviceAccountsEnabled": true,
+  "standardFlowEnabled": false, "directAccessGrantsEnabled": false }
+
+# 2. 給它 realm-management 中的最小權限角色(而非 realm-admin)
+#    可選:manage-users / view-users / manage-clients / view-realm / manage-realm ...
+POST /admin/realms/{realm}/users/{serviceAccountUserId}/role-mappings/clients/{realmMgmtClientId}
+
+# 3. 用 client_credentials 換 token,呼叫 Admin API
+POST /realms/{realm}/protocol/openid-connect/token
+     grant_type=client_credentials&client_id=automation&client_secret=…
+```
+
+**權限模型要點:**
+
+- 每個 realm 都有一個內建 client `realm-management`,其 client role 就是該 realm 的管理權限集合;`realm-admin` 是它們的 composite(相當於該 realm 的 root,**CI/CD 不該直接拿**)
+- `master` realm 的 `admin` 可跨所有 realm(對應 `{realm}-realm` client roles)— 這是最高權限,應限制來源網段並強制 MFA
+- 稽核:Admin Events 必須開啟並含 representation,否則「誰改了這個 client」查不出來
+
+**常用端點速查:**
+
+| 目的 | 端點 |
+|------|------|
+| Realm 列表/建立 | `GET /admin/realms`、`POST /admin/realms` |
+| Client 查詢(依 clientId) | `GET /admin/realms/{r}/clients?clientId=web-app` |
+| 使用者查詢/分頁 | `GET /admin/realms/{r}/users?briefRepresentation=true&first=0&max=100` |
+| 使用者數量 | `GET /admin/realms/{r}/users/count` |
+| 角色指派 | `POST /admin/realms/{r}/users/{id}/role-mappings/realm` |
+| 強制登出 | `POST /admin/realms/{r}/users/{id}/logout` |
+| Session 檢視 | `GET /admin/realms/{r}/clients/{id}/user-sessions` |
+| 組態匯出(不停機) | `POST /admin/realms/{r}/partial-export?exportClients=true` |
+
+> **實務提醒:** Admin API 的使用者查詢預設分頁上限有限(常見 100),大量匯出必須自行分頁迴圈;`briefRepresentation=false` 會顯著增加回應大小與 DB 負擔,批次作業務必評估。
+
+### 6.5 學習任務
 
 - [ ] 用 docker compose 建立 Keycloak + PostgreSQL,完成一個 realm 的完整設定
 - [ ] 將該 realm 匯出成 JSON,用 keycloak-config-cli 重建到第二個環境
 - [ ] 寫一份 Terraform 定義同樣的 realm(比較兩種 IaC 取徑)
+- [ ] 建立 `automation` service account,只給 `view-users`,驗證它**無法**建立 client(最小權限原則的實證)
 
 ---
 
@@ -761,7 +926,24 @@ spring:
   2. **Token Exchange**(正規,audience 乾淨)
   3. 服務自己的 client credentials(遺失原始使用者身分,審計斷鏈)
 
-### 7.5 學習任務(整合 Lab)
+### 7.5 整合踩雷清單(實務高頻問題)
+
+以下每一項都是真實專案中反覆出現的問題,建議直接納入你的整合驗收清單:
+
+| 症狀 | 根因 | 解法 |
+|------|------|------|
+| API 回 401,錯誤訊息 issuer 不符 | Keycloak 前有反向代理,`iss` 產生自請求 host | 固定 `KC_HOSTNAME`,並設 `proxy-headers=xforwarded` |
+| 內外網 issuer 不一致(容器內叫 `keycloak:8080`,對外叫 `sso.example.com`) | 服務端與瀏覽器走不同 URL | 統一 issuer;必要時內部走 DNS 別名指向同一 hostname |
+| 偶發 `token is not yet valid` / 剛簽發就過期 | 節點與應用主機**時鐘漂移** | 全節點 NTP;驗證方設定合理 clock skew(30~60 秒) |
+| SPA 呼叫 token 端點被 CORS 擋 | client 的 **Web Origins** 未設定 | 明確列出來源(勿用 `*`) |
+| 多分頁同時 refresh,其中一個被登出 | Refresh token rotation 下的**併發競態**:舊 token 被重用即視為竊取 | 前端 refresh 加互斥鎖/單飛(single-flight);或評估 reuse window |
+| 使用者資料改了但 token 沒變 | Token 是簽發當下的快照 | 等 token 過期,或走 `/userinfo`;高敏感判斷不要只靠 token 快照 |
+| 呼叫 API 隨機 400/431 | Token 過大撐爆代理 header 上限(見 §5.5) | 關閉 full scope、精簡 role/claim |
+| 微服務鏈路第二段驗 `aud` 失敗 | 原 token 直傳,audience 沒有下游服務 | Audience Mapper 或 Token Exchange(§7.4) |
+| 登出後使用者仍在線 | 應用沒實作 Back-Channel Logout(見 §3.5) | 納入整合驗收必測項 |
+| 升級後自訂屬性消失 | Declarative User Profile 拒絕 unmanaged attributes(見 §5.5) | 正式宣告屬性 |
+
+### 7.6 學習任務(整合 Lab)
 
 - [ ] 建立完整 Demo:SPA(PKCE)+ Spring Boot BFF + 兩個 Resource Server,含跨服務 token exchange
 - [ ] 為上述系統寫 Cucumber 情境測試:登入、授權失敗(403)、token 過期換發
@@ -814,10 +996,37 @@ sequenceDiagram
 
 **架構價值:** 應用只需信任 Keycloak 一個 issuer,上游 IdP 的更換/增加不影響應用 — 這就是「身分反壅塞層(Anti-Corruption Layer)」。
 
-### 8.4 學習任務
+### 8.4 使用者遷移策略(從既有系統搬進 Keycloak)
+
+導入案幾乎都不是綠地專案 — 已經有幾十萬筆帳號在舊系統。核心難題是:**密碼雜湊通常搬不過來**(演算法不同、salt 格式不同)。三種正規解法:
+
+| 策略 | 做法 | 適用 | 代價 |
+|------|------|------|------|
+| **Big Bang 批次匯入** | 用 Admin API / `kc.sh import` 匯入使用者,密碼全部重設 | 使用者數少、可接受全員改密碼 | 使用者體驗衝擊大、客服量暴增 |
+| **漸進式(Lazy)遷移** | 實作 **UserStorageProvider SPI** 代理舊系統:首次登入時向舊系統驗證密碼,成功後在 Keycloak 建立本地帳號並寫入 Keycloak 格式的密碼雜湊 | 大多數企業案 | 需開發 SPI、需維持雙寫期 |
+| **自訂 Password Hash Provider** | 實作舊系統雜湊演算法的 `PasswordHashProvider`,直接匯入舊雜湊值 | 舊演算法可重現(如 bcrypt、特定 PBKDF2 參數) | 需長期保留該 provider,或搭配「下次登入自動升級雜湊」 |
+
+**漸進式遷移的標準時序:**
+
+```
+階段 1:雙寫期     舊系統仍為權威,Keycloak 透過 SPI 讀取並代理驗證
+階段 2:切換期     Keycloak 成為權威,已遷移使用者走本地認證,未遷移者仍代理
+階段 3:收斂期     設定截止日;剩餘未登入帳號批次匯入 + 強制改密碼
+階段 4:下線       移除 SPI 與舊系統,保留稽核紀錄
+```
+
+**遷移必須一併處理的項目(最常被遺漏):**
+
+- **識別碼對應**:Keycloak 的 `sub` 是新 UUID,與舊系統 user id 不同 → 把舊 id 存為 user attribute 並映射進 token(`legacy_uid` claim),否則下游系統對不上人
+- MFA 憑證(OTP secret)通常無法搬遷 → 規劃重新註冊流程
+- 帳號狀態:停用、鎖定、密碼到期、必須改密碼 → 對應到 `enabled` 與 Required Actions
+- 遷移**演練與回滾**:先用生產資料的匿名化副本跑一次完整遷移,量測耗時與失敗率
+
+### 8.5 學習任務
 
 - [ ] 用 Docker 起一個 OpenLDAP,設定 federation + periodic sync,觀察兩種 edit mode 行為
 - [ ] 設定 Google 或 Azure AD brokering,自訂 First Login Flow(自動連結同 email 帳號的風險與對策)
+- [ ] 設計一份 10 萬筆使用者的遷移計畫:選定策略、切換時序、回滾條件、稽核對帳方式
 
 ---
 
@@ -1012,11 +1221,51 @@ spec:
 - 常見瓶頸排序:DB(尤其 password hash iterations)> 快取失衡 > CPU
 - Argon2/PBKDF2 的 iterations 是「登入 TPS」的直接除數 — 安全與容量的明確權衡點
 
-### 11.5 學習任務
+### 11.5 多站點與災難復原(金融業必答題)
+
+§11.1 的三節點叢集只解決**單一站點內**的節點故障。機房整體失效(斷電、天災、網路中斷)需要跨站設計 — 這是金融業 BCP/DR 演練的必考題。
+
+**官方建議的架構是 Active/Passive(非 Active/Active):**
+
+```
+        ┌──────────── Global LB(健康檢查 + 手動/自動切換)─────────┐
+        ▼                                                        ▼
+┌───────────────────────┐                        ┌───────────────────────┐
+│ Site A(Active)        │                        │ Site B(Passive)       │
+│  Keycloak ×3          │                        │  Keycloak ×3(熱待命)  │
+│  External Infinispan  │◀── 跨站複寫(RELAY)──▶│  External Infinispan  │
+└──────────┬────────────┘                        └──────────┬────────────┘
+           ▼                                                ▼
+     PostgreSQL Primary ─────── 非同步/同步複寫 ────────▶ PostgreSQL Standby
+```
+
+**為什麼不是 Active/Active?** 兩站同時寫入時,跨站延遲會讓 session 與登入流程的一致性難以保證(認證流程是多步驟有狀態互動),官方明確建議 Active/Passive。
+
+**關鍵設計點:**
+
+| 項目 | 說明 |
+|------|------|
+| External Infinispan | 多站部署改用**外部 Infinispan(Data Grid)叢集**,而非嵌入式;Keycloak 以 remote store 連接,跨站用 cross-site replication |
+| 資料庫複寫 | DB 是真正的權威來源;同步複寫 RPO≈0 但吃跨站延遲,非同步複寫延遲低但可能丟秒級資料 |
+| Issuer 一致 | 兩站必須是**同一個 hostname/issuer**,否則切換後所有已簽發 token 驗證失敗 |
+| 簽章金鑰 | 金鑰存在 DB,隨複寫過去 — 不要在兩站各自產生金鑰 |
+| 切換程序 | 切換不是「打開就好」:需先確認 standby 追平、封鎖舊站寫入、再切 LB;必須有 runbook 與定期演練 |
+| RTO / RPO | 明確定義並實測:例如 RTO ≤ 15 分、RPO ≤ 1 分;沒有實測數字的 DR 計畫等於沒有 |
+
+**降級選項(成本考量):** 若無法負擔跨站 Infinispan,可接受「切換後所有使用者需重新登入」— 只複寫資料庫。這對內部系統通常可接受,對網銀則需業務單位書面同意。
+
+**備份與復原的三層:**
+
+1. **DB 備份**(權威):定期全備 + WAL/binlog 連續備份,並實測**還原**(只備不還原等於沒備份)
+2. **Realm 匯出**(組態):納入版控(§6.3),可在空機上快速重建組態
+3. **Secrets**:client secret、DB 密碼、TLS 憑證存於 Vault/Secret Manager,DR 站需可獨立取得
+
+### 11.6 學習任務
 
 - [ ] 用 Kind + Operator 部署 3 節點叢集,登入後 `kubectl delete pod` 驗證 session 存活
 - [ ] 用 keycloak-benchmark 對單節點與三節點做登入壓測,產出容量報告
 - [ ] 演練 realm 災難復原:從備份完整重建並驗證既有 client 可無縫接回
+- [ ] 撰寫一份跨站切換 runbook,標明 RTO/RPO 目標、切換判準、回切條件
 
 ---
 
@@ -1032,13 +1281,53 @@ spec:
 | SSO Session Max | 8~10 小時 | 工作日邊界 |
 | Offline Token | 非必要不開 | 長期憑證風險 |
 
-### 12.2 Client 強化(Client Policies)
+### 12.2 多因子認證、Passkey 與 Step-up Authentication
+
+密碼是最弱的一環;**認證強度分級**則是金融場景的核心設計。
+
+**Keycloak 支援的認證因子:**
+
+| 因子 | Keycloak 機制 | 備註 |
+|------|--------------|------|
+| TOTP / HOTP | 內建 OTP Policy + `Configure OTP` Required Action | 相容 Google Authenticator 等 |
+| WebAuthn(二階段) | `webauthn-register` / WebAuthn Authenticator | 安全金鑰、平台生物辨識 |
+| **Passkey / 無密碼登入** | WebAuthn Passwordless(Resident Key + User Verification) | 抗釣魚,現代首選 |
+| Recovery Codes | Required Action(一次性備援碼) | 遺失裝置時的救援路徑 — 常被遺漏 |
+| 簡訊 / 推播 OTP | 需自訂 Authenticator SPI(Module 10) | 台灣金融業常見需求 |
+| CIBA | 解耦認證(櫃員發起、客戶手機確認) | 見 §3.6 |
+
+**設計要點:**
+
+- **抗釣魚等級**:SMS OTP < TOTP < WebAuthn/Passkey。監管趨勢是往 WebAuthn 靠攏;若仍需 SMS,至少要做通道獨立與頻率限制
+- **救援路徑就是攻擊面**:MFA 導入案最常被攻破的不是因子本身,而是「忘記手機怎麼辦」的客服流程 — 必須一併設計並演練
+- MFA 的啟用透過 Authentication Flow 的 **Conditional 子流程**(見 §5.3),可依 role、group 或風險條件觸發
+
+**Step-up Authentication(分級認證)— 高風險交易的正解:**
+
+```
+使用者以密碼登入(LoA 1)──▶ 查詢餘額:通過
+                        └─▶ 執行轉帳:應用要求 acr_values=2 重新導向 Keycloak
+                                       │
+                                       ▼
+                          Keycloak 檢查目前 session 的認證等級不足
+                          ──▶ 只補做 OTP/生物辨識(不必重新輸入密碼)
+                          ──▶ 簽發 acr=2 的新 token,session 升級
+```
+
+- 機制:Authentication Flow 中設定 **Condition - Level of Authentication**,把 flow 步驟對應到 LoA 數值;client 端在 Advanced 設定 **ACR to LoA Mapping**
+- 應用發起授權請求時帶 `acr_values=2`(或 `claims` 參數指定 `essential` 的 acr)
+- **Resource Server 必須驗證 token 中的 `acr` claim** — 只在前端判斷等於沒做
+- `auth_time` claim 搭配 `max_age` 參數可要求「近期認證過」(如 5 分鐘內),防止長 session 下的越權操作
+
+> **架構意涵:** Step-up 讓「認證強度」成為 token 的一個可驗證屬性,授權決策因此能依交易風險動態調整 — 這是金融場景相對其他產業最關鍵的差異化需求。
+
+### 12.3 Client 強化(Client Policies)
 
 - 對所有 client 套用 policy:強制 PKCE、禁用 implicit、精確 redirect URI、secret 輪替
 - 機密客戶端優先採 **private_key_jwt** 或 mTLS 取代 client_secret
 - FAPI profile 一鍵套用(開放銀行場景)
 
-### 12.3 攻擊面與對策
+### 12.4 攻擊面與對策
 
 | 威脅 | Keycloak 對策 |
 |------|--------------|
@@ -1048,8 +1337,12 @@ spec:
 | 開放重導向 | 精確 redirect URI 比對(禁萬用字元) |
 | Session 固定 | Keycloak 內建 session id 更換 |
 | Admin 面暴露 | Admin Console 走獨立 hostname/網段(`KC_HOSTNAME_ADMIN`),僅內網可達 |
+| Refresh Token 竊取 | Rotation + 重用偵測(重用即撤銷整條鏈);公開客戶端優先採 BFF 讓 token 不落瀏覽器 |
+| 端點濫用 / DoS | Keycloak 本身無完整限流:在 WAF/Ingress 對 `/token`、`/auth`、`/userinfo` 設速率限制;登入端點特別容易被當成帳號枚舉與撞庫入口 |
+| 帳號枚舉 | 登入/忘記密碼/註冊的錯誤訊息統一化(Keycloak 預設已模糊化,自訂 theme 時勿破壞) |
+| 惡意 IdP 斷言 | Brokering 時嚴格驗上游簽章與 issuer,First Login Flow **勿無條件以 email 自動連結帳號**(帳號接管經典路徑) |
 
-### 12.4 可觀測性
+### 12.5 可觀測性
 
 - **Metrics**:`/metrics`(Prometheus 格式)— 登入成功/失敗率、token 簽發量、快取命中率、DB pool
 - **Health**:`/health/ready`、`/health/live`(K8s probes)
@@ -1057,16 +1350,28 @@ spec:
 - **Tracing**:26.x 內建 OpenTelemetry tracing — 可接上你既有的 Zipkin/Elasticsearch 觀測堆疊
 - 建議告警:登入失敗率突升(憑證填充)、token 換發延遲 P99、JGroups 視圖變更(叢集分裂)
 
-### 12.5 升級策略
+### 12.6 升級策略與版本支援政策
+
+**版本節奏(導入前必須讓管理層知道的事):**
+
+- Keycloak 上游社群版**只維護最新版本** — 沒有舊版安全修補分支。新版釋出後,舊版即無官方修補
+- 發版頻率約每年 3~4 次(含主版本);安全修補以 patch 版本(如 26.2.x)釋出
+- 需要「一個版本用三年」的組織,應評估 **Red Hat build of Keycloak(RHBK)** 的長期支援訂閱
+- **治理結論**:把「每季評估、每年至少升級一到兩次」寫進維運 SLA,並預留相容性測試工時;否則專案交付一年後就會處在無修補狀態
+
+**升級執行:**
 
 - 主版本升級前:讀 Upgrading Guide 的 breaking changes、SPI 相容性測試、DB schema migration 在 staging 演練
 - 藍綠不可行(DB schema 單向),採 rolling(Operator 支援)+ 明確回滾預案(DB 備份時點)
+- **不可跨太多版本一次跳**:migration 路徑只保證相鄰主版本;落後太多需分段升級
+- 升級前必查清單:自訂 SPI、自訂 Theme(升級後版面破圖是常態)、已棄用的 feature flag、Admin API 欄位變更
 
-### 12.6 學習任務
+### 12.7 學習任務
 
 - [ ] 設定 Grafana dashboard(官方提供 Keycloak dashboard 範本)
 - [ ] 模擬暴力破解,驗證漸進鎖定與事件告警鏈路
 - [ ] 完成一次 minor 版本 rolling upgrade 演練並記錄 runbook
+- [ ] 設定 Conditional OTP + ACR to LoA mapping,實作「轉帳需 acr=2」並在 Resource Server 驗證 `acr` claim
 
 ---
 
@@ -1100,7 +1405,39 @@ spec:
 - TPP(第三方業者)onboarding:Dynamic Client Registration + 憑證信任鏈驗證
 - Consent 管理:Authorization Services 建模客戶授權範圍(帳戶、期限)
 
-### 13.4 綜合結業專案(Capstone)
+### 13.4 稽核、法遵與交付物
+
+技術做完不等於專案結案 — 金融業導入案的驗收往往卡在稽核與文件。
+
+**稽核軌跡(Audit Trail)最低要求:**
+
+| 問題 | 靠什麼回答 |
+|------|-----------|
+| 誰在何時從哪個 IP 登入/登入失敗? | Login Events(需開啟並設定保留期限) |
+| 誰改了這個 client / 角色指派? | Admin Events(需開啟 **include representation**) |
+| 帳號何時被停權、由誰執行? | Admin Events + 內部工單系統對帳 |
+| 特權帳號(realm-admin)的所有操作? | Admin Events + SIEM 即時告警 |
+
+- Keycloak 內建事件保留期以 realm 設定控制;**長期保存應透過 EventListener SPI 轉送到 SIEM/Log 平台**,不要把 Keycloak 的 DB 當成稽核倉儲(會拖垮效能)
+- 事件內含個資(IP、username)→ 保存期限與去識別化需符合個資法/GDPR 要求
+
+**常見法遵對應點:**
+
+- 密碼政策、鎖定策略、session 逾時 → 內控與資安規範的直接對應項,應以 realm 設定截圖 + IaC 版控雙軌佐證
+- 特權存取管理(PAM):`master` realm 管理帳號強制 MFA、限制來源網段、定期覆核
+- 資料落地與跨境:Keycloak 自建的主要理由之一,DR 站點選址需一併檢視
+- 委外與供應鏈:自訂 SPI 的原始碼、相依套件掃描(SCA)納入資安審查
+
+**建議交付物清單(可直接當專案 WBS 的產出項):**
+
+1. 架構決策紀錄(ADR):選型、Realm 切分、授權模型、遷移策略、DR 等級
+2. Realm 組態的 IaC 儲存庫(含環境差異說明)
+3. 部署與維運 runbook:升級、金鑰輪替、DR 切換、緊急停權
+4. 整合開發指引:給各應用團隊的 client 申請流程、驗證清單(§7.5)
+5. 監控與告警定義、事件保留與 SIEM 對接說明
+6. 演練報告:HA 故障、DR 切換、暴力破解、金鑰輪替
+
+### 13.5 綜合結業專案(Capstone)
 
 建立一個完整可展示的 PoC(建議 2~3 天):
 
@@ -1130,6 +1467,14 @@ spec:
 10. Token Exchange 解決微服務鏈路的什麼問題?不用它會有什麼審計/安全缺口?
 11. Argon2 iterations 調高,對安全與容量各有什麼影響?如何量化?
 12. Back-Channel 與 Front-Channel Logout 的機制差異?各在什麼網路拓撲下失效?
+13. 使用者按了「登出」之後,他手上的 access token 立刻失效嗎?為什麼?要做到立即失效有哪些代價?
+14. Step-up Authentication 的完整鏈路怎麼跑?`acr` 與 `auth_time` 各扮演什麼角色?Resource Server 該驗什麼?
+15. 舊系統的密碼雜湊搬不進 Keycloak,你有哪三種遷移策略?各自的使用者衝擊是什麼?
+16. 為什麼官方建議多站點採 Active/Passive 而非 Active/Active?切換時 issuer 與簽章金鑰要注意什麼?
+17. Client Scope 的 Default 與 Optional 差在哪?為什麼它是 token 契約治理的關鍵?
+18. Token 太大會造成什麼生產事故?從哪幾個地方縮減?
+19. Keycloak 社群版的版本支援政策是什麼?對企業維運計畫有何影響?
+20. Realm、Organization、Group 三種切分各在什麼情境使用?誤用會有什麼後果?
 
 ---
 
@@ -1163,6 +1508,46 @@ spec:
 - oidc-client-ts、keycloak-js、Nimbus JOSE+JWT
 - keycloak-config-cli、Terraform Keycloak Provider
 - dasniko/testcontainers-keycloak
+
+---
+
+## 附錄 C:錯誤訊息排查對照表
+
+實務上 80% 的問題會落在下列訊息之一。先對照這張表,再去翻 log。
+
+| 錯誤訊息 | 常見成因 | 排查方向 |
+|---------|---------|---------|
+| `invalid_client`(401) | 機密客戶端沒帶 secret / 公開客戶端多帶了 secret / client 認證方式不符 | 核對 client 型別與 `Client authentication` 設定 |
+| `unauthorized_client` | 該 client 未啟用此 grant type | 開啟對應的 Standard flow / Direct access grants / Service accounts |
+| `invalid_grant`:code 相關 | code 已用過、逾時(預設 60 秒)、`redirect_uri` 不一致 | 確認一次性使用;比對兌換時的 `redirect_uri` 與授權時完全相同 |
+| `invalid_grant`: `PKCE verification failed` | `code_verifier` 與當初的 `code_challenge` 不符 | 檢查 verifier 有無在流程中被覆寫;確認用 S256 而非 plain |
+| `invalid_grant`: `Session not active` | SSO session 已逾時或被登出 | 檢查 SSO Idle/Max;refresh token 壽命受 session 牽制 |
+| `Invalid parameter: redirect_uri` | 未註冊或不精確符合 | 精確比對(含結尾斜線、埠、scheme);勿用萬用字元 |
+| `invalid_token` / 401 於 Resource Server | 簽章、`iss`、`aud`、`exp` 任一不符 | 依 §3.3 的六項驗證清單逐條檢查;優先懷疑 issuer 與時鐘 |
+| `Failed to verify token signature` / 找不到 `kid` | JWKS 快取過期或金鑰已輪替 | 確認驗證方會依 `kid` 重新拉取 JWKS;檢查快取 TTL |
+| `Account is temporarily disabled` | Brute Force Detection 觸發鎖定 | Admin Console 解鎖;檢視是否為撞庫攻擊 |
+| `Account is not fully set up` | 有未完成的 Required Action(改密碼、設定 OTP) | 檢視使用者的 Required Actions |
+| `HTTPS required` | 生產模式下用 HTTP 存取 | 設定 TLS 或正確的 `proxy-headers` |
+| `Hostname is not configured` / issuer 是內部主機名 | 未設 `KC_HOSTNAME` 或代理標頭未信任 | 見 §6.2、§7.5 |
+| `Database may be already in use`(export 時) | dev 模式 H2 檔案被運行中的伺服器鎖住 | 停機匯出、改用外部 DB,或用 partial-export API |
+| 400/431 隨機發生於帶 token 的請求 | Token 過大撐爆代理 header 上限 | 見 §5.5 縮減 token |
+| 自訂屬性寫入後消失 | Declarative User Profile 拒絕 unmanaged attributes | 見 §5.5 |
+
+---
+
+## 附錄 D:近期版本演進重點(22 → 26)
+
+導入前要知道自己站在哪個版本、以及哪些「網路上的舊教學」已經過時:
+
+| 版本 | 重點變更 | 對架構/維運的影響 |
+|------|---------|------------------|
+| 22 | 移除舊 WildFly 發行版,Quarkus 成為唯一發行版;Admin Console v2 | 舊版的 `standalone.xml` 調校知識全數作廢 |
+| 23–24 | **Argon2** 成為非 FIPS 環境的預設密碼雜湊;Declarative User Profile GA | 登入 CPU 成本模型改變;unmanaged attributes 預設受限(§5.5) |
+| 25 | Persistent user sessions 進入 preview;Admin/管理端點調整 | 開始準備 session 落 DB 的容量規劃 |
+| **26.0** | **Persistent user sessions 預設啟用**;**Organizations GA**;`KC_BOOTSTRAP_ADMIN_*` 取代 `KEYCLOAK_ADMIN` | 重啟不掉 session(Infinispan 退為快取);B2B 多租戶有了正規解;舊啟動指令失效 |
+| 26.1–26.2 | OpenTelemetry tracing、FAPI 2.0 client profiles、DPoP 仍為 preview | 可觀測性接軌既有 APM;開放銀行合規可一鍵套 profile;DPoP 需 `--features=dpop` |
+
+> **實務提醒:** 網路上多數中文 Keycloak 教學仍停留在 WildFly 時代或 `KEYCLOAK_ADMIN` 年代,照抄會直接失敗。以官方文件的版本切換器對齊你部署的版本,是最省時間的做法。
 
 ---
 

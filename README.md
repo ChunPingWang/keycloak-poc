@@ -19,13 +19,17 @@
 - [第 5 章:Authorization Code Flow + PKCE 完整實作](#第-5-章authorization-code-flow--pkce-完整實作)
 - [第 6 章:動手驗證安全機制](#第-6-章動手驗證安全機制)
 - [第 7 章:其他必會端點](#第-7-章其他必會端點)
-- [第 8 章:Token 生命週期與 Session 模型](#第-8-章token-生命週期與-session-模型)
-- [第 9 章:密碼儲存與簽章金鑰](#第-9-章密碼儲存與簽章金鑰)
-- [第 10 章:組態匯出與環境管理入門](#第-10-章組態匯出與環境管理入門)
-- [第 11 章:清理環境與下一步學習路徑](#第-11-章清理環境與下一步學習路徑)
+- [第 8 章:角色、群組與授權(RBAC 動手做)](#第-8-章角色群組與授權rbac-動手做)
+- [第 9 章:登出與 Session 終止](#第-9-章登出與-session-終止)
+- [第 10 章:Token 生命週期與 Session 模型](#第-10-章token-生命週期與-session-模型)
+- [第 11 章:密碼儲存與簽章金鑰](#第-11-章密碼儲存與簽章金鑰)
+- [第 12 章:組態匯出與環境管理入門](#第-12-章組態匯出與環境管理入門)
+- [第 13 章:清理環境與下一步學習路徑](#第-13-章清理環境與下一步學習路徑)
 - [附錄 A:驗證報告](#附錄-a驗證報告)
 - [附錄 B:疑難排解 FAQ](#附錄-b疑難排解-faq)
 - [附錄 C:術語速查表](#附錄-c術語速查表)
+- [附錄 D:用 Docker Compose + PostgreSQL 建立可保存的環境](#附錄-d用-docker-compose--postgresql-建立可保存的環境)
+- [附錄 E:啟用雙因子認證(TOTP)](#附錄-e啟用雙因子認證totp)
 
 ---
 
@@ -120,6 +124,7 @@ Keycloak 實作了兩個業界標準,初學最容易混淆:
 
 - Docker(本教材以 Docker 29.x 驗證)
 - `curl`、`openssl`、`python3`(解析 JSON 與解碼 JWT 用)
+- `jq`(第 8、9 章使用;沒有的話可用 `python3 -c` 替代,但 `jq` 會讓指令短很多)
 
 ### 1.2 啟動 Keycloak(開發模式)
 
@@ -671,9 +676,316 @@ Spring 會自動抓 discovery → 取得 JWKS → 快取公鑰 → 離線驗每�
 
 ---
 
-## 第 8 章:Token 生命週期與 Session 模型
+## 第 8 章:角色、群組與授權(RBAC 動手做)
 
-### 8.1 實測的預設值(Keycloak 26.2.5)
+> 📌 **本章與第 9 章、附錄 D、附錄 E 為後續補充內容**,指令依 Keycloak 26.2 的 Admin REST API 撰寫,但**未納入附錄 A 那批 2026-08-13 的自動化實測**。若執行結果與描述不符,請以你的版本為準並回報。
+
+到目前為止,你的 token 只回答了「你是誰」。這一章補上另一半:**「你能做什麼」**。
+
+### 8.1 Keycloak 的三層權限模型
+
+```
+Realm Role(realm 層級)      跨應用共通的身分,如 customer、employee
+    ↑ 可組合(Composite)
+Client Role(client 層級)    某個應用內的權限,如 account-api 的 account-viewer
+    ↑ 透過
+Group(群組)                 把「人」分群,群組帶角色 → 使用者繼承
+```
+
+**設計準則(先講結論,做完你會有體感):**
+
+- **角色代表權限,群組代表組織** — 用群組管「誰」,用角色管「能做什麼」,兩者不要混用
+- 應用程式內**不要硬編角色名稱四處判斷**;把細粒度權限收斂成少數幾個角色
+- 一個 realm role 可以是多個 client role 的組合(Composite Role)— 這是「職務」的建模方式
+
+### 8.2 建立角色並指派
+
+先準備好本章要用的變數(承接第 3 章的 `$ADMIN_TOKEN`;過期就重取):
+
+```bash
+BASE=http://localhost:8080
+H="Authorization: Bearer $ADMIN_TOKEN"
+
+# 取得 web-app 這個 client 的內部 UUID(注意:不是 clientId,Admin API 用 UUID)
+CID=$(curl -s -H "$H" "$BASE/admin/realms/demo/clients?clientId=web-app" | jq -r '.[0].id')
+# 取得 alice 的 UUID
+UID_ALICE=$(curl -s -H "$H" "$BASE/admin/realms/demo/users?username=alice" | jq -r '.[0].id')
+```
+
+建立一個 realm role 與一個 client role:
+
+```bash
+# realm role:customer(跨應用的身分)
+curl -s -X POST "$BASE/admin/realms/demo/roles" -H "$H" -H "Content-Type: application/json" \
+  -d '{"name": "customer", "description": "一般客戶"}'
+
+# client role:web-app 底下的 account-viewer(應用內的權限)
+curl -s -X POST "$BASE/admin/realms/demo/clients/$CID/roles" -H "$H" -H "Content-Type: application/json" \
+  -d '{"name": "account-viewer", "description": "可檢視帳戶"}'
+```
+
+指派給 alice(**注意:role-mappings 端點要的是完整的 role 物件陣列,不是名稱字串**,這是初學者最常卡住的地方):
+
+```bash
+# 指派 realm role
+REALM_ROLE=$(curl -s -H "$H" "$BASE/admin/realms/demo/roles/customer")
+curl -s -X POST "$BASE/admin/realms/demo/users/$UID_ALICE/role-mappings/realm" \
+  -H "$H" -H "Content-Type: application/json" -d "[$REALM_ROLE]"
+
+# 指派 client role
+CLIENT_ROLE=$(curl -s -H "$H" "$BASE/admin/realms/demo/clients/$CID/roles/account-viewer")
+curl -s -X POST "$BASE/admin/realms/demo/users/$UID_ALICE/role-mappings/clients/$CID" \
+  -H "$H" -H "Content-Type: application/json" -d "[$CLIENT_ROLE]"
+```
+
+**重新取一次 token,親眼看見角色出現在裡面:**
+
+```bash
+AT2=$(curl -s -X POST "$BASE/realms/demo/protocol/openid-connect/token" \
+  -d grant_type=password -d client_id=web-app -d client_secret=web-app-secret \
+  -d username=alice -d password=alice-password -d 'scope=openid profile email' | jq -r .access_token)
+
+echo "$AT2" | cut -d. -f2 | python3 -c 'import sys,base64,json;s=sys.stdin.read().strip();print(json.dumps(json.loads(base64.urlsafe_b64decode(s+"==")),indent=2,ensure_ascii=False))' \
+  | jq '{realm_access, resource_access}'
+```
+
+預期會看到:
+
+```json
+{
+  "realm_access": { "roles": ["customer", "offline_access", "uma_authorization", "default-roles-demo"] },
+  "resource_access": { "web-app": { "roles": ["account-viewer"] } }
+}
+```
+
+**這裡有兩個關鍵觀念:**
+
+1. **realm role 放在 `realm_access.roles`,client role 放在 `resource_access.<clientId>.roles`** — Spring Security 預設不認得這個結構,所以需要自訂 Converter(見 `keycloak-poc.md` §7.2)
+2. 角色是**簽發當下的快照**。你現在改了角色,alice 手上那張舊 token 不會變 — 要等它過期(5 分鐘)或重新登入
+
+### 8.3 用群組管理「人」
+
+```bash
+# 建立群組
+curl -s -X POST "$BASE/admin/realms/demo/groups" -H "$H" -H "Content-Type: application/json" \
+  -d '{"name": "branch-taipei"}'
+GID=$(curl -s -H "$H" "$BASE/admin/realms/demo/groups?search=branch-taipei" | jq -r '.[0].id')
+
+# 群組帶角色
+curl -s -X POST "$BASE/admin/realms/demo/groups/$GID/role-mappings/realm" \
+  -H "$H" -H "Content-Type: application/json" -d "[$REALM_ROLE]"
+
+# 把 alice 加進群組(注意是 PUT,不是 POST)
+curl -s -X PUT "$BASE/admin/realms/demo/users/$UID_ALICE/groups/$GID" -H "$H"
+```
+
+之後新進的分行同仁只要加進群組就自動有權限 — 這就是「用群組管人」的價值:**人員異動不用動角色設定**。
+
+> 群組成員資格預設**不會**出現在 token 裡。需要的話得加一個 Group Membership mapper(下一節就是在做這件事)。
+
+### 8.4 Protocol Mapper:把自訂資料放進 Token
+
+實務需求:token 裡要帶「分行代碼」,讓 API 直接依此做資料隔離。
+
+**⚠️ 先過 26.x 的一道關卡** — Keycloak 24 起啟用了 Declarative User Profile,**沒有事先宣告的自訂屬性預設會被丟棄**。這是「明明 PUT 成功,屬性卻不見了」的元凶:
+
+```bash
+# 開啟未受管屬性(學習環境的快解;生產環境建議正式宣告屬性)
+curl -s -H "$H" "$BASE/admin/realms/demo/users/profile" \
+  | jq '. + {unmanagedAttributePolicy: "ENABLED"}' \
+  | curl -s -X PUT "$BASE/admin/realms/demo/users/profile" -H "$H" -H "Content-Type: application/json" -d @-
+```
+
+然後給 alice 一個屬性,並建立 mapper 把它送進 token:
+
+```bash
+# 寫入使用者屬性
+curl -s -X PUT "$BASE/admin/realms/demo/users/$UID_ALICE" -H "$H" -H "Content-Type: application/json" \
+  -d '{"attributes": {"branch_code": ["001"]}}'
+
+# 建立 protocol mapper:user attribute → token claim
+curl -s -X POST "$BASE/admin/realms/demo/clients/$CID/protocol-mappers/models" \
+  -H "$H" -H "Content-Type: application/json" -d '{
+    "name": "branch-code",
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-usermodel-attribute-mapper",
+    "config": {
+      "user.attribute": "branch_code",
+      "claim.name": "branch_code",
+      "jsonType.label": "String",
+      "access.token.claim": "true",
+      "id.token.claim": "true",
+      "userinfo.token.claim": "true"
+    }
+  }'
+```
+
+再取一次 token,payload 裡就會多出 `"branch_code": "001"`。
+
+> **架構意涵:** Token 是 IdP 與應用之間的 **API 契約**。加一個 claim 看似小事,但下游可能有十個系統依賴它 — Mapper 的變更應該跟 API 變更一樣納入版控與變更管理。
+
+### 8.5 Audience Mapper:讓 token 能被指定的 API 接受
+
+第 4 章說過「API 必須驗 `aud`」。那麼一張給 `web-app` 的 token,要怎麼讓 `account-api` 願意接受?
+
+```bash
+curl -s -X POST "$BASE/admin/realms/demo/clients/$CID/protocol-mappers/models" \
+  -H "$H" -H "Content-Type: application/json" -d '{
+    "name": "account-api-audience",
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-audience-mapper",
+    "config": {
+      "included.client.audience": "account-api",
+      "access.token.claim": "true"
+    }
+  }'
+```
+
+新取的 access token,`aud` 會包含 `account-api`。**這才是微服務間傳遞 token 的正規做法** — 而不是讓每個 API 都放寬 `aud` 檢查(那等於把安全門拆掉)。
+
+### 8.6 本章重點回顧
+
+| 你做了什麼 | 對應的真實用途 |
+|-----------|--------------|
+| realm role / client role | 跨應用身分 vs 應用內權限的分層 |
+| 指派角色 → 觀察 token 變化 | 理解授權資訊如何隨 token 傳遞 |
+| 群組帶角色 | 用組織架構管理權限,人員異動零成本 |
+| Protocol Mapper | 把企業自有資料(分行、風險等級)帶進 token |
+| Audience Mapper | 讓 token 能被正確的 Resource Server 接受 |
+
+進階的集中式授權(細緻到「這筆帳戶只有本人和客服主管能看」)屬於 Keycloak Authorization Services,見 `keycloak-poc.md` Module 9。
+
+---
+
+## 第 9 章:登出與 Session 終止
+
+登入只做一次就會了,**登出卻是導入案最常出包的地方**。這章把三種登出方式做過一遍,並釐清一個關鍵誤解。
+
+### 9.1 三種登出,語意完全不同
+
+| 方式 | 做法 | 銷毀範圍 |
+|------|------|---------|
+| **RP-Initiated Logout** | 瀏覽器導向 `/protocol/openid-connect/logout` | 整個 SSO session(所有應用一起登出) |
+| **後端撤銷** | 後端 POST logout 端點,帶 `refresh_token` | 該 session |
+| **管理者強制登出** | Admin API `/users/{id}/logout` | 該使用者的全部 session |
+
+### 9.2 動手做:後端撤銷(最容易驗證的一種)
+
+先拿一組 token(承接第 4 章的做法),然後撤銷它:
+
+```bash
+RESP=$(curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=web-app -d client_secret=web-app-secret \
+  -d username=alice -d password=alice-password -d 'scope=openid profile email')
+AT3=$(echo "$RESP" | jq -r .access_token)
+RT3=$(echo "$RESP" | jq -r .refresh_token)
+
+# 登出(銷毀 session)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8080/realms/demo/protocol/openid-connect/logout \
+  -d client_id=web-app -d client_secret=web-app-secret -d refresh_token="$RT3"
+# 預期:204
+```
+
+驗證 refresh token 真的失效了:
+
+```bash
+curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token \
+  -d grant_type=refresh_token -d client_id=web-app -d client_secret=web-app-secret \
+  -d refresh_token="$RT3"
+# 預期:{"error":"invalid_grant","error_description":"Session not active"} 之類
+```
+
+### 9.3 ⚠️ 最重要的一個觀念:登出銷毀的是 session,不是 access token
+
+繼續用剛才**已經登出**的那張 access token:
+
+```bash
+# introspection:會說失效(因為它會回頭查 session)
+curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token/introspect \
+  -u web-app:web-app-secret -d token="$AT3" | jq .active
+# 預期:false
+```
+
+但是 —— **一個只做離線驗章的 API(第 4.4 節那種,也就是絕大多數 Spring Boot Resource Server)看不到這件事**。它只驗簽章、`iss`、`aud`、`exp`,這些全都還成立,所以**它會繼續接受這張 token 直到過期(最多 5 分鐘)**。
+
+```
+登出時刻 ──────────── 最多 5 分鐘 ──────────▶ token 自然過期
+   │                                              │
+   ├─ session 立刻銷毀,refresh 立刻失效             │
+   └─ 但離線驗章的 API 仍會放行這張 access token ────┘
+```
+
+這不是 bug,是第 4.4 節「離線驗證」那個設計的**必然代價**。實務上的處理:
+
+| 需求 | 做法 |
+|------|------|
+| 一般業務 API | 接受這幾分鐘的空窗(把 access token 壽命設短) |
+| 高風險操作(轉帳、改個資) | 該筆請求改用 **introspection** 線上查驗 |
+| 使用者已被停權 | Admin 強制登出 + 停用帳號,並確保關鍵 API 走線上查驗 |
+
+### 9.4 RP-Initiated Logout(使用者按「登出」按鈕)
+
+真實的網頁登出是把瀏覽器導到:
+
+```
+http://localhost:8080/realms/demo/protocol/openid-connect/logout
+  ?id_token_hint=<ID Token>
+  &post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A3000%2F
+```
+
+- `id_token_hint`:告訴 Keycloak 是誰要登出(沒帶的話 Keycloak 會顯示確認頁)
+- `post_logout_redirect_uri`:**必須事先在 client 註冊**,否則 26.x 會拒絕:
+
+```bash
+curl -s -X PUT "$BASE/admin/realms/demo/clients/$CID" -H "$H" -H "Content-Type: application/json" \
+  -d '{"attributes": {"post.logout.redirect.uris": "http://localhost:3000/*"}}'
+```
+
+> 小技巧:把值設為 `+` 表示「沿用已註冊的 redirect URIs」。
+
+### 9.5 其他應用怎麼知道使用者登出了?(Back-Channel Logout)
+
+Keycloak 銷毀 session 後,會主動通知每個 client:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 使用者
+    participant KC as Keycloak
+    participant A as App A(後端)
+    participant B as App B(後端)
+
+    U->>KC: 點「登出」
+    KC->>KC: 銷毀 SSO session
+    par 伺服器對伺服器通知
+        KC->>A: POST backchannel_logout_uri(logout_token)
+        A->>A: 驗章後殺掉自己的本地 session
+        KC->>B: POST backchannel_logout_uri(logout_token)
+        B->>B: 同上
+    end
+    KC-->>U: 導回 post_logout_redirect_uri
+```
+
+- `logout_token` 是一張 JWT,內含 `sid`(session id)與登出事件標記;應用要**驗簽後**再依 `sid` 終止本地 session
+- 設定位置:Client → Settings → **Backchannel logout URL**
+- 另有 Front-Channel Logout(用 iframe),但現代瀏覽器封鎖第三方 cookie 後常失效 —— **新專案一律優先用 Back-Channel**
+
+### 9.6 管理者強制登出(集中停權的實作基礎)
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/admin/realms/demo/users/$UID_ALICE/logout" -H "$H"
+# 預期:204 — alice 的所有 session 立即銷毀
+```
+
+這就是第 0 章說的「員工離職,一個地方停權」實際長什麼樣子。
+
+---
+
+## 第 10 章:Token 生命週期與 Session 模型
+
+### 10.1 實測的預設值(Keycloak 26.2.5)
 
 | 設定 | 實測預設值 | 設計理由 |
 |------|-----------|---------|
@@ -684,7 +996,7 @@ Spring 會自動抓 discovery → 取得 JWKS → 快取公鑰 → 離線驗每�
 
 位置:Admin Console → 選 `demo` realm → **Realm settings** → **Sessions / Tokens** 頁籤。
 
-### 8.2 Session 與 Token 的關係
+### 10.2 Session 與 Token 的關係
 
 ```mermaid
 flowchart LR
@@ -707,25 +1019,27 @@ flowchart LR
 - Refresh token 綁著 session:session 逾時/被登出 → refresh 立刻失效
 - 26.x 起 session **預設持久化到資料庫**(`persistent-user-sessions` 功能),伺服器重啟使用者不再被登出
 
-### 8.3 觀察線上 session
+### 10.3 觀察線上 session
 
 Admin Console → **Users** → alice → **Sessions** 頁籤,可看到她目前的 SSO session 與登入的 client,並可強制登出(session 銷毀後,她的 refresh token 立即失效 — 這就是「集中停權」的實作基礎)。
 
 ---
 
-## 第 9 章:密碼儲存與簽章金鑰
+## 第 11 章:密碼儲存與簽章金鑰
 
-### 9.1 密碼是怎麼存的?(✅ 實測)
+### 11.1 密碼是怎麼存的?(✅ 實測)
 
 用 Admin API 查 alice 的密碼憑證中繼資料:
 
 ```bash
-UID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+UID_ALICE=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://localhost:8080/admin/realms/demo/users?username=alice" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://localhost:8080/admin/realms/demo/users/$UID/credentials" | python3 -m json.tool
+  "http://localhost:8080/admin/realms/demo/users/$UID_ALICE/credentials" | python3 -m json.tool
 ```
+
+> 變數名刻意用 `UID_ALICE` 而不是 `UID`:**`UID` 在 bash / zsh 中是唯讀的內建變數**,直接指派會得到 `UID: readonly variable` 而中斷。
 
 實測的 `credentialData`:
 
@@ -747,7 +1061,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 - 每個使用者的 salt 都不同 → 彩虹表無效
 - 伺服器同時內建 `argon2`、`pbkdf2-sha512` 等 provider(✅ 實測),可用 Password Policy 切換與調參 — 這是「安全 vs 登入吞吐量」的權衡點(調高成本,登入 TPS 直接下降)
 
-### 9.2 簽章金鑰與輪替
+### 11.2 簽章金鑰與輪替
 
 ```bash
 curl -s http://localhost:8080/realms/demo/protocol/openid-connect/certs | python3 -m json.tool
@@ -765,9 +1079,9 @@ curl -s http://localhost:8080/realms/demo/protocol/openid-connect/certs | python
 
 ---
 
-## 第 10 章:組態匯出與環境管理入門
+## 第 12 章:組態匯出與環境管理入門
 
-### 10.1 用 Admin API 匯出 realm 組態(✅ 實測可用)
+### 12.1 用 Admin API 匯出 realm 組態(✅ 實測可用)
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -777,7 +1091,7 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ✅ 實測成功匯出 realm 與全部 client 定義(注意:partial-export **不含使用者與 secret**)。
 
-### 10.2 ⚠️ 陷阱實錄:`kc.sh export` 在 dev 模式會失敗
+### 12.2 ⚠️ 陷阱實錄:`kc.sh export` 在 dev 模式會失敗
 
 教科書上的完整匯出指令:
 
@@ -793,21 +1107,21 @@ docker exec keycloak /opt/keycloak/bin/kc.sh export --dir /tmp/export --realm de
 2. 使用外接 PostgreSQL(生產模式本來就必須),export 即可與服務並行;或
 3. 用 10.1 的 partial-export API(不停機,但不含使用者)
 
-### 10.3 組態即程式碼(原則)
+### 12.3 組態即程式碼(原則)
 
 生產環境的鐵律:**Admin Console 只用來探索,正式變更一律走版控** — 工具有 `keycloak-config-cli`(宣告式 JSON)與 Terraform Keycloak Provider。詳見 `keycloak-poc.md` Module 6。
 
 ---
 
-## 第 11 章:清理環境與下一步學習路徑
+## 第 13 章:清理環境與下一步學習路徑
 
-### 11.1 清理
+### 13.1 清理
 
 ```bash
 docker rm -f keycloak
 ```
 
-### 11.2 你已經學會了什麼
+### 13.2 你已經學會了什麼
 
 完成本教材後,你已親手驗證:
 
@@ -816,10 +1130,12 @@ docker rm -f keycloak
 - [x] Authorization Code + PKCE 完整流程(不靠 SDK)
 - [x] 四個安全機制:code 一次性(+重放觸發撤銷)、PKCE 驗證、state、SSO cookie
 - [x] Discovery、JWKS、introspection、userinfo、refresh、client credentials
+- [x] 角色/群組/Protocol Mapper/Audience Mapper — 授權資訊如何進到 token
+- [x] 三種登出方式,以及「登出不等於 access token 立刻失效」的關鍵代價
 - [x] Token 生命週期預設值與 session 模型
 - [x] Argon2 密碼儲存與金鑰輪替原理
 
-### 11.3 下一步:接上進階課綱
+### 13.3 下一步:接上進階課綱
 
 依 [`keycloak-poc.md`](./keycloak-poc.md) 的學習路徑繼續:
 
@@ -836,6 +1152,8 @@ docker rm -f keycloak
 ## 附錄 A:驗證報告
 
 **驗證環境**:Keycloak 26.2.5(`quay.io/keycloak/keycloak:26.2`)、Docker 29.6、WSL2,驗證日期 2026-08-13。方式:實際啟動伺服器,以腳本執行 40+ 項自動化檢查。
+
+> **驗證範圍說明(誠實揭露):** 下列報告涵蓋**第 0~7 章與第 10~13 章**。後續補充的**第 8 章(RBAC)、第 9 章(登出)、附錄 D、附錄 E** 依 Keycloak 26.2 官方 Admin REST API 與 OIDC 規格撰寫,**尚未納入這批自動化實測**;執行時若與描述有出入,請以你的版本行為為準。
 
 ### A.1 驗證通過的重要宣稱(節錄)
 
@@ -862,8 +1180,8 @@ docker rm -f keycloak
 | 位置 | 原文 | 實測/查證修正 |
 |------|------|--------------|
 | M1 §1.1 | 「預設使用 Argon2(**26.x 起**)」 | Argon2 自 **Keycloak 24** 起即為非 FIPS 環境預設([KC 24 release notes](https://www.keycloak.org/docs/25.0.6/release_notes/index.html)) |
-| M5 §5.5 | 「`sessions` 快取 Distributed(**預設 2 owners**)」 | 26.2 預設組態實測為 `sessions`/`clientSessions` **`owners=1`** 且 `max-count=10000`(因 session 已預設落 DB,Infinispan 退為快取);`owners=2` 僅 `authenticationSessions`,或關閉 persistent sessions 的舊制部署 |
-| M3 §3.5 / M12 | DPoP 列為可用規格 | DPoP 在 26.2 為 **PREVIEW feature,預設停用**,需 `--features=dpop` 啟用 |
+| M5 §5.6 | 「`sessions` 快取 Distributed(**預設 2 owners**)」 | 26.2 預設組態實測為 `sessions`/`clientSessions` **`owners=1`** 且 `max-count=10000`(因 session 已預設落 DB,Infinispan 退為快取);`owners=2` 僅 `authenticationSessions`,或關閉 persistent sessions 的舊制部署 |
+| M3 §3.6 / M12 | DPoP 列為可用規格 | DPoP 在 26.2 為 **PREVIEW feature,預設停用**,需 `--features=dpop` 啟用 |
 | M6 §6.3 | `kc.sh export` 作為匯出手段 | 對**運行中的 dev 模式(H2)**執行會因資料庫檔案鎖而失敗;需先停機、改用外部 DB,或改用 partial-export API |
 
 ### A.3 其他查證
@@ -891,6 +1209,24 @@ A:admin token 也是 access token,預設 60 秒(master realm 的 admin-cli)~5 �
 **Q:為什麼我照做 Password Grant 卻被拒?**
 A:client 需開啟 `directAccessGrantsEnabled`(Admin Console 中叫「Direct access grants」)。再次強調:此 grant 僅供教學觀察。
 
+**Q:我用 Admin API 幫使用者加了自訂屬性,回傳成功但查不到?**
+A:Keycloak 24 起的 Declarative User Profile 預設丟棄未宣告的屬性。依第 8.4 節開啟 Unmanaged Attributes,或正式在 User Profile 宣告該屬性。
+
+**Q:指派角色回 400 或沒反應?**
+A:`role-mappings` 端點收的是**完整 role 物件的陣列**(要有 `id` 與 `name`),不是名稱字串;而且路徑上的 client 要用**內部 UUID**,不是 `clientId`。見第 8.2 節取 UUID 的寫法。
+
+**Q:改了使用者的角色,為什麼 token 裡沒變?**
+A:token 是簽發當下的快照。等它過期(預設 5 分鐘)重新換發,或重新登入。
+
+**Q:已經登出了,為什麼 API 還讓我進去?**
+A:登出銷毀的是 session,不是已簽發的 access token。離線驗章的 API 會接受它直到過期 — 完整說明見第 9.3 節。
+
+**Q:登出時回「Invalid redirect uri」?**
+A:`post_logout_redirect_uri` 必須事先在 client 註冊(`post.logout.redirect.uris`),見第 9.4 節。
+
+**Q:token 突然變得很大,或呼叫 API 出現奇怪的 400/431?**
+A:角色、群組、屬性塞太多會讓 JWT 膨脹,撐爆反向代理的 header 上限。關閉 client 的 Full scope allowed、精簡 claim,詳見 `keycloak-poc.md` §5.5。
+
 ## 附錄 C:術語速查表
 
 | 術語 | 白話解釋 |
@@ -913,7 +1249,99 @@ A:client 需開啟 `directAccessGrantsEnabled`(Admin Console 中叫「Direct acc
 | Federation | 接既有使用者來源(LDAP/AD) |
 | Brokering | 把認證委託給第三方 IdP(Google、Azure AD) |
 | SPI | Keycloak 的擴充點:自訂認證步驟、事件監聽等 |
+| Realm Role / Client Role | 跨應用的身分 vs 單一應用內的權限 |
+| Protocol Mapper | 決定 token 裡放哪些欄位的「生產線」 |
+| Audience(`aud`) | 這張 token 是「發給誰用」的;API 必須驗它 |
+| Back-Channel Logout | Keycloak 直接呼叫各應用後端通知登出(不經瀏覽器) |
+| Required Action | 登入後強制使用者完成的動作(改密碼、設定 OTP) |
+| TOTP | 以時間為基礎的一次性密碼(Google Authenticator 那類) |
 
 ---
 
-*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。進階內容請接續 [`keycloak-poc.md`](./keycloak-poc.md)。*
+## 附錄 D:用 Docker Compose + PostgreSQL 建立可保存的環境
+
+第 1 章的 `docker run` 用內嵌 H2,容器一刪設定就沒了,而且第 12.2 節的 `kc.sh export` 也會因檔案鎖失敗。想長期保留學習成果,改用這份 compose:
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    command: start                      # 生產模式(非 start-dev)
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KC_HOSTNAME: http://localhost:8080   # 固定 issuer,避免 token 驗證出錯
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"              # 學習環境才這樣;生產一定要 TLS
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8080:8080"
+      - "9000:9000"                        # 26.x 的 health/metrics 在獨立的管理埠
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d
+curl -sf http://localhost:9000/health/ready && echo " ready"
+```
+
+**幾個值得注意的細節:**
+
+- `start`(非 `start-dev`)會在啟動時做一次 build,首次啟動比較慢是正常的
+- **`/health/ready` 在 26.x 走 9000 管理埠**,不在 8080 — 這是常見的健康檢查設定錯誤來源
+- `KC_HOSTNAME` 固定後,所有 token 的 `iss` 就穩定了(對照附錄 B 的 issuer 問題)
+- 有了外接 DB,第 12.2 節那個 `kc.sh export` 的檔案鎖問題自然消失
+- 清理:`docker compose down`(保留資料)、`docker compose down -v`(連資料一起刪)
+
+---
+
+## 附錄 E:啟用雙因子認證(TOTP)
+
+最小可行的 MFA 體驗,兩步驟(承接第 8 章設定好的 `$BASE`、`$H`、`$UID_ALICE`):
+
+**1. 要求 alice 下次登入時設定 OTP**
+
+```bash
+curl -s -X PUT "$BASE/admin/realms/demo/users/$UID_ALICE" -H "$H" -H "Content-Type: application/json" \
+  -d '{"requiredActions": ["CONFIGURE_TOTP"]}'
+```
+
+**2. 用瀏覽器走一次登入**(第 5 章的授權 URL,或直接開 Account Console `http://localhost:8080/realms/demo/account`)
+
+Keycloak 會在密碼驗證後跳出 QR Code,用任何 TOTP App(Google Authenticator、1Password…)掃描並輸入驗證碼完成綁定。之後每次登入都會多問一次 6 位數字。
+
+**延伸觀念(這才是重點):**
+
+- OTP 的參數(演算法、位數、時間窗)在 **Realm settings → Authentication → OTP Policy**
+- 「**所有人都要 MFA**」與「**只有特定族群才要**」的差別,在於 Authentication Flow 裡用的是 `Required` 還是 **Conditional 子流程** — 這是 Keycloak 認證流程引擎的核心能力
+- 更強的因子是 **WebAuthn / Passkey**(抗釣魚),Keycloak 原生支援;高風險交易則用 **Step-up Authentication**(`acr_values`)只在需要時追加驗證
+- 別忘了設計**救援路徑**(遺失手機怎麼辦)—— MFA 專案最常被攻破的是客服流程,不是密碼學
+
+完整機制見 `keycloak-poc.md` §12.2。
+
+---
+
+*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。第 8、9 章與附錄 D、E 為後續補充(見附錄 A 的驗證範圍說明)。進階內容請接續 [`keycloak-poc.md`](./keycloak-poc.md)。*
