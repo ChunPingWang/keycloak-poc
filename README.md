@@ -3,9 +3,20 @@
 > 這是一份**從零開始、每個指令都實際驗證過**的 Keycloak 動手教材。
 > 所有指令與輸出均於 **Keycloak 26.2.5**(Docker, 2026-08-13)實測通過,共 40+ 項驗證全數成功(詳見[附錄 A:驗證報告](#附錄-a驗證報告))。
 >
-> 本教材與 [`keycloak-poc.md`](./keycloak-poc.md) 搭配使用:
-> - **README.md(本文)**:初學者動手教材 — 跟著做,建立第一手的體感與正確心智模型
-> - **`keycloak-poc.md`**:完整進階課綱(13 個 Module,從協定原理到生產部署)— 動手做完本教材後,依其學習路徑深入
+## 本儲存庫包含三個部分
+
+| 內容 | 定位 | 什麼時候讀 |
+|------|------|-----------|
+| **README.md(本文)** | 初學者動手教材 — 用 `curl` 純手工走完每個流程,建立第一手體感與正確心智模型 | **從這裡開始** |
+| **[`keycloak-poc.md`](./keycloak-poc.md)** | 完整進階課綱(13 個 Module,從協定原理到生產部署) | 動手做完本教材後,依其學習路徑深入 |
+| **[`spring-boot-lab/`](./spring-boot-lab/)** | **可建置執行的整合實作** — Spring Boot 3 + Keycloak 26 的電商會員管理(DDD × 六角形架構 × SOLID,含測試) | 想看「真實專案怎麼寫」時;對應進階課綱的 Module 7 |
+
+```
+概念與協定原理 ──▶ 純手工實作(curl)──▶ 真實專案程式碼
+keycloak-poc.md      README.md            spring-boot-lab/
+```
+
+---
 
 ---
 
@@ -171,7 +182,68 @@ curl -s http://localhost:8080/realms/master/.well-known/openid-configuration | p
 
 ## 第 2 章:核心概念地圖
 
-進 Admin Console 之前,先建立這張心智地圖 — 之後每個操作你都知道自己在動哪一層:
+### 2.1 先把名詞放到正確的層次
+
+初學者最大的困擾不是某個名詞難懂,而是**一堆名詞混在一起分不清誰是誰**:IdP、SSO、OAuth 2.0、OIDC、JWT、RBAC、Keycloak…… 它們其實**不是互相競爭的技術**,而是分屬五個不同層次、一起組成整套架構:
+
+```mermaid
+flowchart TB
+    subgraph L1["① 身分層:誰負責確認你是誰"]
+        IDP["<b>IdP</b> 身分提供者(一種角色,不是特定產品)<br/>Keycloak / Entra ID / Okta / Google"]
+    end
+    subgraph L2["② 協定層:用什麼標準溝通"]
+        OIDC["<b>OIDC</b> = OAuth 2.0 + 身分層<br/>回答「登入的人是誰」"]
+        OAUTH["<b>OAuth 2.0</b> 授權框架<br/>回答「這個應用能存取什麼」"]
+        SAML["<b>SAML 2.0</b><br/>傳統企業 SSO 協定"]
+    end
+    subgraph L3["③ 憑證層:拿到什麼、長什麼樣"]
+        JWT["<b>JWT</b> 只是 Token 的一種<b>格式</b><br/>Header.Payload.Signature"]
+    end
+    subgraph L4["④ 權限層:能不能做這件事"]
+        RBAC["<b>RBAC</b> 用 Role 決定<br/>「你是什麼角色」"]
+        SCOPE["<b>Scope</b> 決定<br/>「這張 token 被授權做什麼」"]
+    end
+    subgraph L5["⑤ 產品層"]
+        KC["<b>Keycloak</b> = IAM 產品<br/>把上面全部實作出來"]
+    end
+
+    IDP -->|實作| OIDC
+    OIDC -->|建立在| OAUTH
+    IDP -.->|也支援| SAML
+    OAUTH -->|簽發 Access Token,常以| JWT
+    OIDC -->|加發 ID Token,格式必為| JWT
+    JWT -->|裡面帶著 roles / scope| RBAC
+    JWT --> SCOPE
+    KC -.->|扮演| IDP
+```
+
+用一句話串起來:
+
+> **Keycloak 作為 IdP 與授權伺服器,透過 OIDC 完成認證與 SSO、透過 OAuth 2.0 簽發 Access Token;Token 採 JWT 格式,API 驗完 JWT 後再用 Role / Scope 做授權判斷。**
+
+一張表對照「每個名詞解決什麼問題」:
+
+| 名詞 | 它是什麼 | 解決什麼問題 |
+|------|---------|-------------|
+| Authentication(認證) | 過程 | **你是誰?** |
+| Authorization(授權) | 過程 | **你能做什麼?** |
+| IdP | 一種**角色** | 誰負責確認身分 |
+| OAuth 2.0 | 協定/框架 | 應用如何取得存取資源的權限 |
+| OIDC | 協定(蓋在 OAuth 上) | 如何知道登入者是誰 |
+| JWT | **資料格式** | Token 如何攜帶 claims 並可離線驗證 |
+| RBAC | 權限模型 | 依角色決定能做什麼 |
+| SSO | 一種**架構能力/體驗** | 登入一次,多系統通行 |
+| Keycloak | **產品** | 把以上能力整包實作出來 |
+
+**三個最常見的名詞誤解,先講清楚:**
+
+- ❌ **「SSO 是一種協定」** → SSO 不是協定,是一種**能力**;它可以用 OIDC 實現,也可以用 SAML 實現。
+- ❌ **「JWT = OAuth = OIDC」** → JWT 只是**格式**。OAuth 的 Access Token 不一定是 JWT(也可以是不透明字串);而 OIDC 的 ID Token 則規定必須是 JWT。
+- ❌ **「Keycloak 就是 OAuth」** → Keycloak 是**產品**,它「實作」了 OAuth 2.0、OIDC、SAML 等標準,兩者是「產品」與「規格」的關係。
+
+### 2.2 Keycloak 內部的結構地圖
+
+上面是名詞之間的關係,這裡是 Keycloak **內部**的組成 — 之後每個操作你都知道自己在動哪一層:
 
 ```
 Keycloak 伺服器
@@ -843,7 +915,45 @@ curl -s -X POST "$BASE/admin/realms/demo/clients/$CID/protocol-mappers/models" \
 
 新取的 access token,`aud` 會包含 `account-api`。**這才是微服務間傳遞 token 的正規做法** — 而不是讓每個 API 都放寬 `aud` 檢查(那等於把安全門拆掉)。
 
-### 8.6 本章重點回顧
+### 8.6 Role 與 Scope 的分工(很多人混在一起用)
+
+你在第 4 章看過 `scope`,這一章又做了 role。兩者都在 token 裡、都跟權限有關,差別是什麼?
+
+```json
+{
+  "sub": "ffb6bcf4-…",
+  "scope": "openid profile email order.read order.write",
+  "realm_access": { "roles": ["customer", "order-admin"] }
+}
+```
+
+| | Role | Scope |
+|---|------|-------|
+| 回答的問題 | **這個「人」是什麼角色** | **這張 token 被授權做什麼** |
+| 綁在誰身上 | 使用者(或 service account) | 這次授權請求 / 這個 client |
+| 誰決定 | 管理者指派 | 授權請求時要求 + client 允許的範圍 |
+| 典型值 | `customer`、`order-admin` | `order.read`、`order.write` |
+
+**為什麼需要兩者?** 想像同一位 `order-admin` 使用者:
+
+- 從公司後台登入 → token 拿到 `order.read order.write`(完整權限)
+- 授權某個第三方報表工具存取 → 只給 `order.read`(即使他本人是 admin,**這張 token 也只能讀**)
+
+也就是說:**Role 描述「人的權限上限」,Scope 描述「這次授權實際開放多少」**。真實的判斷是兩者的交集:
+
+```
+最終能做的事 = 使用者的 Role 允許的 ∩ 這張 token 的 Scope 允許的
+```
+
+實務建議(避免權限模型爆炸):
+
+- API 的判斷條件寫成「**需要 scope `order.write` 且 role 為 `order-admin`**」,而不是把所有情況都塞成一個新角色
+- 角色數量要收斂;每多一個角色就多一份治理成本,幾十個角色之後沒有人說得清誰能做什麼
+- 別讓應用程式到處硬編 `if role == "ADMIN"` — 這是角色爆炸的起點
+
+> Keycloak 中的 scope 由 **Client Scopes** 管理(可設為 Default 或 Optional),細節見 `keycloak-poc.md` §5.5;更細緻的「這一筆資料只有本人能看」屬於 ABAC 範疇,見 Module 9。
+
+### 8.7 本章重點回顧
 
 | 你做了什麼 | 對應的真實用途 |
 |-----------|--------------|
@@ -1146,6 +1256,8 @@ docker rm -f keycloak
 | 實戰整合 | M7 | Spring Boot / SPA / API Gateway 完整 Lab |
 | 企業功能 | M8–M10 | LDAP 聯邦、身分代理、授權服務、SPI 擴充開發 |
 | 生產部署 | M11–M13 | Kubernetes HA 叢集、安全維運、金融業實戰場景 |
+
+**想直接看真實專案怎麼寫?** 本儲存庫的 [`spring-boot-lab/`](./spring-boot-lab/) 是一份可建置執行的完整實作:Spring Boot 3 + Keycloak 26 的電商會員管理,用 DDD 與六角形架構把「認證」與「會員領域」的邊界切開,含 21 個測試(領域、授權、ArchUnit 架構規則)。你在本教材手工做過的每個概念,在那裡都能看到它在真實程式碼中的樣子。
 
 ---
 

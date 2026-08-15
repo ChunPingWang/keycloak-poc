@@ -3,6 +3,9 @@
 > 一份從**底層協定原理**出發、貫穿到**企業級生產部署**的 Keycloak 系統化學習路徑。
 > 目標讀者:應用架構師、後端工程師、DevOps / SRE、需要導入 IAM 的技術顧問。
 > 適用版本:Keycloak 26.x(Quarkus 發行版),概念適用於 22+ 所有版本。
+>
+> **搭配使用:** [`README.md`](./README.md) 是初學者的動手教材(用 `curl` 走完每個流程);
+> [`spring-boot-lab/`](./spring-boot-lab/) 是可建置執行的整合實作(Spring Boot 3 × DDD × 六角形架構),對應 Module 7。
 
 ---
 
@@ -926,7 +929,61 @@ spring:
   2. **Token Exchange**(正規,audience 乾淨)
   3. 服務自己的 client credentials(遺失原始使用者身分,審計斷鏈)
 
-### 7.5 整合踩雷清單(實務高頻問題)
+### 7.5 微服務安全架構分層:North-South 與 East-West
+
+把「誰在呼叫誰」分成兩個方向,是微服務安全設計的第一刀。混在一起談,就會出現「所有服務都拿使用者 token」或「全部走 service account」這兩種極端錯誤。
+
+```
+                      ┌──────────────┐
+                      │   Keycloak   │
+                      └──────┬───────┘
+   North-South(南北向)        │  使用者認證、token 簽發
+   使用者 → 系統               │
+        ┌──────────────────────┼───────────────────────┐
+        ▼                      ▼                       ▼
+   ┌─────────┐          ┌─────────────┐          ┌──────────┐
+   │  SPA    │          │ Mobile App  │          │ 外部 TPP  │
+   └────┬────┘          └──────┬──────┘          └────┬─────┘
+        └───────── User Access Token(JWT)─────────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │    API Gateway      │  ← 邊界:驗章、驗 aud、限流、審計
+                    └──────────┬──────────┘
+   ─────────────────────────────────────────────────────────────
+   East-West(東西向)            │
+   服務 → 服務                   ▼
+        ┌────────────────┬───────────────┬────────────────┐
+        ▼                ▼               ▼                ▼
+   Order Service ──▶ Payment Service ──▶ Ledger    Batch Job(無使用者)
+        └──── 帶身分:Token Relay / Token Exchange ────┘
+                   通道安全:mTLS(服務網格或應用層)
+```
+
+**兩個方向的設計準則:**
+
+| | North-South(使用者 → 系統) | East-West(服務 → 服務) |
+|---|---|---|
+| 身分來源 | 真實使用者(Authorization Code + PKCE) | 服務本身,或**代表使用者**的衍生身分 |
+| 憑證 | User Access Token | Service Account token(Client Credentials)或 Token Exchange 產物 |
+| 驗證重點 | 簽章、`iss`、`aud`、`exp`、scope/role | 同左 + **呼叫方身分**(誰在呼叫) |
+| 通道 | TLS(對外) | **mTLS**(服務間雙向驗證,常由 service mesh 承擔) |
+| 常見錯誤 | Gateway 驗過就不再驗(內網信任假設) | 一路直傳使用者 token,audience 汙染、審計斷鏈 |
+
+**East-West 的三種身分傳遞方式(§7.4 的選項,放進這張圖就清楚了):**
+
+1. **Token Relay(直傳原 token)** — 最簡單,但每個下游都必須被列入 `aud`,且下游拿到的權限與使用者完全相同(過度授權)。適合同一信任域內的少數服務。
+2. **Token Exchange(RFC 8693)** — 服務 A 用使用者 token 換一張「A 代表使用者呼叫 B」的 token:`aud` 乾淨、可縮小 scope、審計鏈完整。**跨團隊/跨信任域的正解**。
+3. **Client Credentials(服務自己的身分)** — 沒有使用者的批次作業、系統對系統整合用這個。代價是**遺失原始使用者身分**,若業務需要追溯「這筆異動是誰觸發的」,審計就斷了 — 此時應改用 Token Exchange,或至少在應用層傳遞經簽章的呼叫來源資訊。
+
+**mTLS 放在哪裡?** mTLS 保護的是**通道與呼叫方機器身分**,JWT 保護的是**使用者/服務的邏輯身分與授權**,兩者互補不可互相取代:
+
+- Service Mesh(Istio/Linkerd)自動做 mTLS → 解決「這個連線來自哪個工作負載」
+- JWT/OAuth → 解決「這個請求代表誰、被授權做什麼」
+- 金融場景另有 **mTLS Client Authentication(RFC 8705)**:client 用憑證向 Keycloak 認證,並可把 token 綁定到該憑證(sender-constrained),被竊也無法在別處使用
+
+> **Zero Trust 的實務底線:** 不因為「在內網」就跳過驗證。每個服務都應該獨立驗 JWT — Gateway 的驗證是第一道,不是唯一一道。
+
+### 7.6 整合踩雷清單(實務高頻問題)
 
 以下每一項都是真實專案中反覆出現的問題,建議直接納入你的整合驗收清單:
 
@@ -943,11 +1000,15 @@ spring:
 | 登出後使用者仍在線 | 應用沒實作 Back-Channel Logout(見 §3.5) | 納入整合驗收必測項 |
 | 升級後自訂屬性消失 | Declarative User Profile 拒絕 unmanaged attributes(見 §5.5) | 正式宣告屬性 |
 
-### 7.6 學習任務(整合 Lab)
+### 7.7 學習任務(整合 Lab)
 
+> 📦 **本儲存庫已附一份可建置執行的參考實作**:[`spring-boot-lab/`](./spring-boot-lab/) — Spring Boot 3 + Keycloak 26 的電商會員管理,以 DDD 與六角形架構把「認證」與「會員領域」切開(領域層不依賴 Keycloak),含 21 個測試。下列任務可直接以它為起點延伸。
+
+- [ ] 讀 `spring-boot-lab/` 的 `KeycloakRealmRoleConverter` 與 `SecurityConfig`,對照 §7.2 的說明
 - [ ] 建立完整 Demo:SPA(PKCE)+ Spring Boot BFF + 兩個 Resource Server,含跨服務 token exchange
 - [ ] 為上述系統寫 Cucumber 情境測試:登入、授權失敗(403)、token 過期換發
 - [ ] 用 Testcontainers 啟動 Keycloak 跑整合測試(`dasniko/testcontainers-keycloak`)
+- [ ] 畫出你手上系統的 North-South / East-West 圖,標出每條邊用的是哪一種身分傳遞方式
 
 ---
 
@@ -1034,7 +1095,31 @@ sequenceDiagram
 
 > Keycloak 不只發 token,還內建一個完整的**集中式授權引擎**(基於 UMA 2.0),可將授權決策從應用程式抽離。
 
-### 9.1 概念模型
+### 9.1 先分清 Role、Scope 與 Permission
+
+進到授權服務之前,必須先把三個常被混用的概念分開 — 混用是「角色爆炸」的根源:
+
+| 概念 | 語意 | 綁在誰身上 | 例子 |
+|------|------|-----------|------|
+| **Role** | 這個**主體**是什麼角色 | 使用者 / service account | `order-admin`、`teller` |
+| **Scope** | **這張 token** 被授權做什麼 | 本次授權請求 / client | `order.read`、`order.write` |
+| **Permission** | **在哪個資源上**能做哪個動作 | 資源 × 動作 × 政策 | 「帳戶 12345 的 `transfer`,僅本人或客服主管」 |
+
+```
+Role   ──▶ 粗粒度:你屬於哪一群人          ← Token claim 即可判斷
+Scope  ──▶ 這次授權開放多少(可小於 Role)  ← Token claim 即可判斷
+Permission ──▶ 細粒度:針對「某一筆資料」   ← 需要 PDP(本 Module)或領域邏輯
+```
+
+**判斷順序(實務上三層都會用到):**
+
+1. Gateway / Resource Server:驗 token → 檢查 **scope**
+2. 方法層(如 Spring `@PreAuthorize`):檢查 **role**
+3. 領域層或 PDP:檢查 **permission**(「這筆資料是不是他的」)
+
+> **關鍵準則:** 「只有本人能改自己的資料」這種規則是**領域規則**,不要為它新增一個角色,也不該塞進 Security 設定 — 它要嘛寫在領域層,要嘛交給本 Module 的授權服務/外部 PDP。把細粒度規則硬塞成角色,就是角色數量失控的開始。
+
+### 9.2 概念模型
 
 ```
 Resource Server(在 Keycloak 註冊)
@@ -1048,13 +1133,13 @@ Resource Server(在 Keycloak 註冊)
 └── Permissions(Resource/Scope × Policies 的綁定)
 ```
 
-### 9.2 決策評估與 RPT
+### 9.3 決策評估與 RPT
 
 - 應用以 access token 向 Keycloak 的 token 端點請求(`grant_type=uma-ticket`)
 - Keycloak 評估 Policies → 簽發 **RPT(Requesting Party Token)**:一個內含 `authorization.permissions` 的 JWT
 - 決策策略:`Affirmative`(一個同意即可)/ `Unanimous`(全數同意)/ `Consensus`
 
-### 9.3 架構選型:何時用它?
+### 9.4 架構選型:何時用它?
 
 | 授權需求 | 建議 |
 |---------|------|
@@ -1062,7 +1147,7 @@ Resource Server(在 Keycloak 註冊)
 | 集中管理、可動態調整的政策 | Keycloak Authorization Services |
 | 極高頻、低延遲、複雜 ABAC | 考慮 OPA / Cedar 等專職 PDP(Keycloak 評估需網路往返) |
 
-### 9.4 學習任務
+### 9.5 學習任務
 
 - [ ] 為「帳戶查詢 API」建立 resource/scope/policy,實作「本人或客服主管可查」的混合政策
 - [ ] 比較同一政策在 Keycloak JS Policy 與 OPA Rego 的實作,寫一頁選型 ADR
@@ -1433,7 +1518,7 @@ spec:
 1. 架構決策紀錄(ADR):選型、Realm 切分、授權模型、遷移策略、DR 等級
 2. Realm 組態的 IaC 儲存庫(含環境差異說明)
 3. 部署與維運 runbook:升級、金鑰輪替、DR 切換、緊急停權
-4. 整合開發指引:給各應用團隊的 client 申請流程、驗證清單(§7.5)
+4. 整合開發指引:給各應用團隊的 client 申請流程、驗證清單(§7.6)
 5. 監控與告警定義、事件保留與 SIEM 對接說明
 6. 演練報告:HA 故障、DR 切換、暴力破解、金鑰輪替
 
