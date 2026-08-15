@@ -1360,7 +1360,7 @@ A:機密客戶端(`publicClient: false`)必須帶 `client_secret`;公開客戶�
 A:redirect_uri 必須與 client 註冊值**精確比對**(這是防 code 竊取的安全設計,不是 bug)。檢查結尾斜線、埠號、http/https。
 
 **Q:token 拿去驗證說 issuer 不符?**
-A:`iss` 是簽發當下的 URL。你用 `localhost:8080` 拿的 token,`iss` 就是它;API 若設定 issuer 為 `127.0.0.1` 或容器內部主機名就會不符。生產環境務必設 `KC_HOSTNAME` 固定 issuer。若 Keycloak 部署在反向代理/LB 後方,issuer 錯亂多半是 proxy 標頭沒設對 — 原理與實作見姊妹教材 [webpage-header-tutorial](https://github.com/ChunPingWang/webpage-header-tutorial)。
+A:`iss` 是簽發當下的 URL。你用 `localhost:8080` 拿的 token,`iss` 就是它;API 若設定 issuer 為 `127.0.0.1` 或容器內部主機名就會不符。生產環境務必設 `KC_HOSTNAME` 固定 issuer。若 Keycloak 部署在反向代理/LB 後方,issuer 錯亂多半是 proxy 標頭沒設對 — 原理與實作見姊妹教材 [proxy-headers-tutorial](https://github.com/ChunPingWang/proxy-headers-tutorial)。
 
 **Q:重啟容器後之前的設定不見了?**
 A:本教材的 `docker run` 沒掛資料卷,`docker rm` 後 H2 資料就沒了。要保留:`-v keycloak-data:/opt/keycloak/data`。
