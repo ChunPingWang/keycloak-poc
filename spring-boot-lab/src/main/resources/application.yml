@@ -1,0 +1,27 @@
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8080/realms/shopmall
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shopmall
+    username: shopmall
+    password: shopmall
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+server:
+  port: 9090
+
+shopmall:
+  keycloak:
+    server-url: http://localhost:8080
+    realm: shopmall
+    admin-client-id: shopmall-backend
+    admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:changeme}   # 由環境變數注入，勿寫死
+    member-role: member
