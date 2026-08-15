@@ -82,15 +82,23 @@ C4Context
     System_Ext(ldap, "LDAP / AD", "既有企業目錄")
     System_Ext(extidp, "外部 IdP", "Google、Azure AD 等")
 
-    Rel(user, appA, "使用")
-    Rel(user, appB, "使用")
-    Rel(appA, keycloak, "登入委託", "OIDC")
-    Rel(appB, keycloak, "登入委託", "OIDC + PKCE")
-    Rel(appA, api, "呼叫", "Bearer token")
-    Rel(api, keycloak, "取公鑰離線驗 token", "JWKS")
-    Rel(keycloak, ldap, "User Federation")
-    Rel(keycloak, extidp, "Identity Brokering")
+    Rel(user, appA, "① 使用")
+    Rel(user, appB, "① 使用")
+    Rel(appA, keycloak, "② 登入委託", "OIDC")
+    Rel(appB, keycloak, "② 登入委託", "OIDC + PKCE")
+    Rel(keycloak, ldap, "③ User Federation(視組態)")
+    Rel(keycloak, extidp, "③ Identity Brokering(視組態)")
+    Rel(appA, api, "④ 呼叫", "Bearer token")
+    Rel(api, keycloak, "⑤ 取公鑰離線驗 token", "JWKS")
 ```
+
+箭頭上的編號就是一次「登入 → 呼叫 API」的先後順序:
+
+1. **使用者開啟應用**(Web 應用或 SPA)
+2. **應用把登入委託給 Keycloak** — 應用自己不碰密碼,把使用者導向 Keycloak 登入頁(OIDC;SPA 加上 PKCE,見第 5 章)
+3. **Keycloak 執行認證**(視組態):帳號在既有 LDAP/AD 就走 User Federation 查驗;要用 Google、Azure AD 登入就走 Identity Brokering 委託出去;都沒有就用 Keycloak 自己資料庫裡的帳密
+4. **應用帶著拿到的 Access Token 呼叫後端 API**(放在 `Authorization: Bearer` 標頭)
+5. **API 離線驗證 token** — 首次先向 Keycloak 的 JWKS 端點取公鑰(之後快取),每個請求都在本地驗章,不必回呼 Keycloak(原理見第 4.4 節)
 
 它提供:
 
@@ -302,7 +310,7 @@ curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token 
 |---|---|---|---|
 | 給誰用 | **Client**(你的應用) | **Resource Server**(API) | 只還給 Keycloak 的 token 端點 |
 | 回答什麼 | 「登入的人是誰」 | 「能存取什麼」 | 「幫我換一組新的」 |
-| 實測壽命 | 跟隨 session | **300 秒(5 分鐘)** | **1800 秒(30 分鐘,滑動)** |
+| 實測壽命 | **300 秒**(同 Access Token Lifespan) | **300 秒(5 分鐘)** | **1800 秒(30 分鐘,滑動)** |
 | 常見錯誤 | ❌ 拿去呼叫 API | ✅ 放在 `Authorization: Bearer` 標頭 | ❌ 傳給任何其他服務 |
 
 ### 4.3 解剖 JWT:三段式結構
@@ -587,12 +595,18 @@ curl -s http://localhost:8080/realms/demo/.well-known/openid-configuration | pyt
 ### 7.2 Refresh Token:換發新的 Access Token
 
 ```bash
-curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token \
+RESP=$(curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token \
   -d grant_type=refresh_token -d client_id=web-app -d client_secret=web-app-secret \
-  -d refresh_token="$RT" | python3 -m json.tool
+  -d refresh_token="$RT")
+echo "$RESP" | python3 -m json.tool
+# 把新的 token 存回變數,7.3 與 7.4 會用到
+AT=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+RT=$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["refresh_token"])')
 ```
 
 ✅ 實測成功取得一組**新的** access token。Access Token 5 分鐘就過期,應用靠這個機制在背景無感續期。
+
+> **為什麼要把 `$AT` 存回來?** 第 5 章曾把 `$AT` 覆寫成 spa-app 的 token,而它已在第 6 章實驗 1 的 code 重放中被**連帶撤銷**。不更新就直接做 7.3,你會看到 `{"active": false}`;做 7.4 會拿到 401 —— 那不是你做錯,是撤銷機制真的生效了。
 
 ### 7.3 Token Introspection:線上查驗 token(RFC 7662)
 
@@ -624,6 +638,15 @@ curl -s http://localhost:8080/realms/demo/protocol/openid-connect/userinfo \
 ### 7.5 Client Credentials:服務對服務(M2M),沒有使用者
 
 批次程式、微服務之間的呼叫,沒有「人」參與,用 client 自己的憑證換 token:
+
+> ⚠️ 第 3 章拿的 `$ADMIN_TOKEN` 壽命只有 **60 秒**(見附錄 B),走到這裡必定已過期(下面的指令會回 401)。先重取一次:
+
+```bash
+ADMIN_TOKEN=$(curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=admin-cli \
+  -d username=admin -d password=admin \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+```
 
 ```bash
 # 建立一個啟用 service account 的 client
@@ -717,7 +740,7 @@ Admin Console → **Users** → alice → **Sessions** 頁籤,可看到她目前
 
 ### 9.1 密碼是怎麼存的?(✅ 實測)
 
-用 Admin API 查 alice 的密碼憑證中繼資料:
+用 Admin API 查 alice 的密碼憑證中繼資料(`$ADMIN_TOKEN` 壽命僅 60 秒,若已過期,先照 7.5 開頭重取一次):
 
 ```bash
 UID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -769,13 +792,15 @@ curl -s http://localhost:8080/realms/demo/protocol/openid-connect/certs | python
 
 ### 10.1 用 Admin API 匯出 realm 組態(✅ 實測可用)
 
+`$ADMIN_TOKEN` 若已過期(壽命僅 60 秒),先照 7.5 開頭重取一次:
+
 ```bash
 curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://localhost:8080/admin/realms/demo/partial-export?exportClients=true&exportGroupsAndRoles=true" \
   > demo-realm-export.json
 ```
 
-✅ 實測成功匯出 realm 與全部 client 定義(注意:partial-export **不含使用者與 secret**)。
+✅ 實測成功匯出 realm 與全部 client 定義。注意兩件事:partial-export **不含一般使用者**(alice 不會被匯出),client secret 也會被遮罩為 `**********`;但啟用 service account 的 client 會連帶匯出其影子使用者(如 `service-account-batch-service`)。
 
 ### 10.2 ⚠️ 陷阱實錄:`kc.sh export` 在 dev 模式會失敗
 
@@ -916,4 +941,4 @@ A:client 需開啟 `directAccessGrantsEnabled`(Admin Console 中叫「Direct acc
 
 ---
 
-*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。進階內容請接續 [`keycloak-poc.md`](./keycloak-poc.md)。*
+*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。2026-08-15 全文複驗(含 Mermaid 圖表渲染與全部指令重跑),修正 4 處:7.2 未回存新 token 導致 7.3/7.4 與宣稱矛盾、ID Token 壽命實為 300 秒(同 Access Token)、7.5/9.1/10.1 的 admin token 過期提醒、partial-export 對 service account 使用者的例外。進階內容請接續 [`keycloak-poc.md`](./keycloak-poc.md)。*
