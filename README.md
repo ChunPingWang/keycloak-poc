@@ -97,7 +97,7 @@ C4Context
 1. **使用者開啟應用**(Web 應用或 SPA)
 2. **應用把登入委託給 Keycloak** — 應用自己不碰密碼,把使用者導向 Keycloak 登入頁(OIDC;SPA 加上 PKCE,見第 5 章)
 3. **Keycloak 執行認證**(視組態):帳號在既有 LDAP/AD 就走 User Federation 查驗;要用 Google、Azure AD 登入就走 Identity Brokering 委託出去;都沒有就用 Keycloak 自己資料庫裡的帳密
-4. **應用帶著拿到的 Access Token 呼叫後端 API**(放在 `Authorization: Bearer` 標頭)
+4. **應用帶著拿到的 Access Token 呼叫後端 API** — token 放在 HTTP 請求的 `Authorization` 標頭,格式固定為 `Authorization: Bearer <access_token>`(標頭詳解見第 4.2 節)
 5. **API 離線驗證 token** — 首次先向 Keycloak 的 JWKS 端點取公鑰(之後快取),每個請求都在本地驗章,不必回呼 Keycloak(原理見第 4.4 節)
 
 它提供:
@@ -312,6 +312,27 @@ curl -s -X POST http://localhost:8080/realms/demo/protocol/openid-connect/token 
 | 回答什麼 | 「登入的人是誰」 | 「能存取什麼」 | 「幫我換一組新的」 |
 | 實測壽命 | **300 秒**(同 Access Token Lifespan) | **300 秒(5 分鐘)** | **1800 秒(30 分鐘,滑動)** |
 | 常見錯誤 | ❌ 拿去呼叫 API | ✅ 放在 `Authorization: Bearer` 標頭 | ❌ 傳給任何其他服務 |
+
+**`Authorization` 標頭速解**
+
+呼叫 API 時,token 放在 HTTP 的 `Authorization` 請求標頭,格式是「認證方案(scheme)+ 空格 + 憑證」:
+
+```http
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+```
+
+`Bearer`(RFC 6750)字面意思是「**持有者**」— 誰拿到這個 token,誰就能用,伺服器不會再問你是誰。這正是 Access Token 必須走 TLS 傳輸、且只有 5 分鐘壽命的原因。
+
+本教材中你還會實際遇到這幾個標頭(均為 26.2.5 實測):
+
+| 標頭 | 哪裡遇到 | 說明 |
+|------|---------|------|
+| `Authorization: Bearer <token>` | 7.4 userinfo、你的 API | 使用者/應用出示 access token |
+| `Authorization: Basic <base64(id:secret)>` | 7.3 introspection 的 `curl -u web-app:web-app-secret` | **client 對 Keycloak** 的認證(HTTP Basic),`-u` 會自動轉成 `Authorization: Basic d2ViLWFwcDo…` — 別和 Bearer 混淆:Basic 證明「應用是誰」,Bearer 出示「使用者授權」 |
+| `Content-Type: application/x-www-form-urlencoded` | 所有對 token 端點的 POST | OAuth 規定 token 端點收**表單編碼**,`curl -d` 會自動設;自己寫程式時誤用 `application/json` 是常見的 400/401 原因 |
+| `WWW-Authenticate`(回應標頭) | 任何 401 回應 | 伺服器告訴你該用哪種 scheme,實測:`WWW-Authenticate: Bearer realm="master"` — 你的 API 回 401 時也應照 RFC 6750 帶上它 |
+
+> ⚠️ 兩個新手常踩的坑:`Bearer` 與 token 之間**必須恰好一個空格**(多引號、少空格都會 401);token **永遠不要放在 URL query string** — 會留在瀏覽器歷史、代理與伺服器 log 裡(同第 5 章「為什麼不直接回傳 token」的理由)。
 
 ### 4.3 解剖 JWT:三段式結構
 
