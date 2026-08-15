@@ -1,6 +1,6 @@
 package com.example.demo;
 
-// 教材(keycloak-poc.md M7.2)省略了 package 與 import,以下 import 為驗證所補;
+// 教材(CURRICULUM.md M7.2)省略了 package 與 import,以下 import 為驗證所補;
 // class 本體逐字取自教材。
 import java.util.List;
 import java.util.Map;

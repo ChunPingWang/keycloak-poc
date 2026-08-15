@@ -3,9 +3,9 @@
 > 這是一份**從零開始、每個指令都實際驗證過**的 Keycloak 動手教材。
 > 所有指令與輸出均於 **Keycloak 26.2.5**(Docker, 2026-08-13)實測通過,共 40+ 項驗證全數成功(詳見[附錄 A:驗證報告](#附錄-a驗證報告))。
 >
-> 本教材與 [`keycloak-poc.md`](./keycloak-poc.md) 搭配使用:
+> 本教材與 [`CURRICULUM.md`](./CURRICULUM.md) 搭配使用:
 > - **README.md(本文)**:初學者動手教材 — 跟著做,建立第一手的體感與正確心智模型
-> - **`keycloak-poc.md`**:完整進階課綱(13 個 Module,從協定原理到生產部署)— 動手做完本教材後,依其學習路徑深入
+> - **`CURRICULUM.md`**:完整進階課綱(13 個 Module,從協定原理到生產部署)— 動手做完本教材後,依其學習路徑深入
 
 ---
 
@@ -118,7 +118,7 @@ Keycloak 實作了兩個業界標準,初學最容易混淆:
 - **OpenID Connect(OIDC)**:建立在 OAuth 2.0 之上的「**認證**」層 — 補上「登入的人是誰」
 
 > 一句話記憶:**OAuth 給你一張門禁卡(Access Token),OIDC 給你一張身分證(ID Token)。**
-> 深入原理見 `keycloak-poc.md` 的 Module 2 與 Module 3。
+> 深入原理見 `CURRICULUM.md` 的 Module 2 與 Module 3。
 
 ---
 
@@ -168,7 +168,7 @@ curl -s http://localhost:8080/realms/master/.well-known/openid-configuration | p
 | Hostname 檢查 | 寬鬆 | 嚴格(必設 `KC_HOSTNAME`) |
 | 用途 | 學習、開發 | 正式環境 |
 
-> ⚠️ **`start-dev` 絕對不可用於生產環境**。生產部署(外接 DB、HA 叢集、Kubernetes)見 `keycloak-poc.md` Module 6 與 Module 11。
+> ⚠️ **`start-dev` 絕對不可用於生產環境**。生產部署(外接 DB、HA 叢集、Kubernetes)見 `CURRICULUM.md` Module 6 與 Module 11。
 
 ---
 
@@ -698,7 +698,7 @@ spring:
           issuer-uri: http://localhost:8080/realms/demo
 ```
 
-Spring 會自動抓 discovery → 取得 JWKS → 快取公鑰 → 離線驗每個請求的 JWT。完整整合(含角色映射、BFF、token exchange)見 `keycloak-poc.md` Module 7。
+Spring 會自動抓 discovery → 取得 JWKS → 快取公鑰 → 離線驗每個請求的 JWT。完整整合(含角色映射、BFF、token exchange)見 `CURRICULUM.md` Module 7。
 
 ### 7.7 Grant Type 選型速查
 
@@ -841,7 +841,7 @@ docker exec keycloak /opt/keycloak/bin/kc.sh export --dir /tmp/export --realm de
 
 ### 10.3 組態即程式碼(原則)
 
-生產環境的鐵律:**Admin Console 只用來探索,正式變更一律走版控** — 工具有 `keycloak-config-cli`(宣告式 JSON)與 Terraform Keycloak Provider。詳見 `keycloak-poc.md` Module 6。
+生產環境的鐵律:**Admin Console 只用來探索,正式變更一律走版控** — 工具有 `keycloak-config-cli`(宣告式 JSON)與 Terraform Keycloak Provider。詳見 `CURRICULUM.md` Module 6。
 
 ---
 
@@ -867,7 +867,7 @@ docker rm -f keycloak
 
 ### 11.3 下一步:接上進階課綱
 
-依 [`keycloak-poc.md`](./keycloak-poc.md) 的學習路徑繼續:
+依 [`CURRICULUM.md`](./CURRICULUM.md) 的學習路徑繼續:
 
 | 你的下一步 | 對應 Module | 內容 |
 |-----------|-------------|------|
@@ -885,7 +885,7 @@ docker rm -f keycloak
 
 ### A.1 驗證通過的重要宣稱(節錄)
 
-| `keycloak-poc.md` 宣稱 | 實測結果 |
+| `CURRICULUM.md` 宣稱 | 實測結果 |
 |------------------------|---------|
 | `KC_BOOTSTRAP_ADMIN_*` 啟動指令(M6) | ✅ 26.2.5 啟動成功 |
 | JWKS 端點 `/realms/{realm}/protocol/openid-connect/certs`(M1) | ✅ 存在,回傳含 `kid` 的公鑰 |
@@ -903,7 +903,7 @@ docker rm -f keycloak
 | `persistent-user-sessions` 26.x 預設啟用(M5/M11) | ✅ feature 為 `DEFAULT, enabled`(25 為 preview,26.0 起預設)|
 | Service account = client credentials 的化身(M5) | ✅ username 為 `service-account-…` |
 
-### A.2 發現的偏差與修正(讀 `keycloak-poc.md` 時請注意)
+### A.2 發現的偏差與修正(讀 `CURRICULUM.md` 時請注意)
 
 | 位置 | 原文 | 實測/查證修正 |
 |------|------|--------------|
@@ -962,4 +962,4 @@ A:client 需開啟 `directAccessGrantsEnabled`(Admin Console 中叫「Direct acc
 
 ---
 
-*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。2026-08-15 全文複驗(含 Mermaid 圖表渲染與全部指令重跑),修正 4 處:7.2 未回存新 token 導致 7.3/7.4 與宣稱矛盾、ID Token 壽命實為 300 秒(同 Access Token)、7.5/9.1/10.1 的 admin token 過期提醒、partial-export 對 service account 使用者的例外。進階內容請接續 [`keycloak-poc.md`](./keycloak-poc.md)。*
+*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。2026-08-15 全文複驗(含 Mermaid 圖表渲染與全部指令重跑),修正 4 處:7.2 未回存新 token 導致 7.3/7.4 與宣稱矛盾、ID Token 壽命實為 300 秒(同 Access Token)、7.5/9.1/10.1 的 admin token 過期提醒、partial-export 對 service account 使用者的例外。進階內容請接續 [`CURRICULUM.md`](./CURRICULUM.md)。*

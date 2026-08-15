@@ -2,7 +2,7 @@
 
 這個小專案用來**實際編譯並執行**教材中的全部 Spring 程式碼,證明它們不只是紙上範例:
 
-- `SecurityConfig.java` — **逐字取自** [`keycloak-poc.md`](../keycloak-poc.md) Module 7.2(含 `keycloakRoleConverter`);教材省略的 `package` 與 `import` 為編譯所補,class 本體未動
+- `SecurityConfig.java` — **逐字取自** [`CURRICULUM.md`](../CURRICULUM.md) Module 7.2(含 `keycloakRoleConverter`);教材省略的 `package` 與 `import` 為編譯所補,class 本體未動
 - `application.yml` — 結構取自 README 7.6 與 M7.2 的 Resource Server + OAuth2 Client 兩段設定,僅把示例主機 `sso.example.com/realms/bank` 換成本機教材環境 `localhost:8080/realms/demo`
 - `TestController.java` — 兩個測試端點:`/api/hello`(登入即可)與 `/api/admin/ping`(需 `account-admin` realm role)
 
