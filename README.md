@@ -795,7 +795,7 @@ Spring 會自動抓 discovery → 取得 JWKS → 快取公鑰 → 離線驗每�
 
 ## 第 8 章:角色、群組與授權(RBAC 動手做)
 
-> 📌 **本章與第 9 章、附錄 D、附錄 E 為後續補充內容**,指令依 Keycloak 26.2 的 Admin REST API 撰寫,但**未納入附錄 A 那批 2026-08-13 的自動化實測**。若執行結果與描述不符,請以你的版本為準並回報。
+> 📌 **本章與第 9 章、附錄 D、附錄 E 為後續補充內容**,已於 **2026-08-15 以 Keycloak 26.2.5 實測通過**(過程中發現並修正了 8.4 的 user-profile「整份取代」陷阱,見該節警告)。
 
 到目前為止,你的 token 只回答了「你是誰」。這一章補上另一半:**「你能做什麼」**。
 
@@ -915,10 +915,13 @@ curl -s -H "$H" "$BASE/admin/realms/demo/users/profile" \
 
 然後給 alice 一個屬性,並建立 mapper 把它送進 token:
 
+> ⚠️ **第二道關卡(2026-08-15 實測踩到):`PUT /users/{id}` 帶 `attributes` 時是「整份取代」**。26.x 起 `email`、`firstName`、`lastName` 本身也是 user-profile 屬性 — 若只送 `{"attributes": {"branch_code": …}}`,這三個欄位會被**洗掉**,之後所有登入都回 `invalid_grant: Account is not fully set up`,而且錯誤訊息完全看不出原因。安全做法永遠是「**先讀出 → 合併 → 寫回**」:
+
 ```bash
-# 寫入使用者屬性
-curl -s -X PUT "$BASE/admin/realms/demo/users/$UID_ALICE" -H "$H" -H "Content-Type: application/json" \
-  -d '{"attributes": {"branch_code": ["001"]}}'
+# 寫入使用者屬性(read-modify-write,保住既有欄位)
+curl -s -H "$H" "$BASE/admin/realms/demo/users/$UID_ALICE" \
+  | jq '.attributes = (.attributes // {}) + {branch_code: ["001"]}' \
+  | curl -s -X PUT "$BASE/admin/realms/demo/users/$UID_ALICE" -H "$H" -H "Content-Type: application/json" -d @-
 
 # 建立 protocol mapper:user attribute → token claim
 curl -s -X POST "$BASE/admin/realms/demo/clients/$CID/protocol-mappers/models" \
@@ -1503,4 +1506,4 @@ Keycloak 會在密碼驗證後跳出 QR Code,用任何 TOTP App(Google Authentic
 
 ---
 
-*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。2026-08-15 全文複驗(含 Mermaid 圖表渲染與全部指令重跑),修正 4 處:7.2 未回存新 token 導致 7.3/7.4 與宣稱矛盾、ID Token 壽命實為 300 秒(同 Access Token)、7.5/11.1/12.1 的 admin token 過期提醒、partial-export 對 service account 使用者的例外。第 8、9 章與附錄 D、E 為後續補充。進階內容請接續 [`CURRICULUM.md`](./CURRICULUM.md)。*
+*教材驗證與撰寫:2026-08-13,基於 Keycloak 26.2.5。2026-08-15 全文複驗(含 Mermaid 圖表渲染與全部指令重跑),修正 4 處:7.2 未回存新 token 導致 7.3/7.4 與宣稱矛盾、ID Token 壽命實為 300 秒(同 Access Token)、7.5/11.1/12.1 的 admin token 過期提醒、partial-export 對 service account 使用者的例外。第 8、9 章與附錄 D、E 為後續補充,已於 2026-08-15 實測通過(修正 8.4 的 PUT attributes 整份取代陷阱);spring-boot-lab 同日 `./mvnw test` 全數通過。進階內容請接續 [`CURRICULUM.md`](./CURRICULUM.md)。*
